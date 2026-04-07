@@ -1,0 +1,15 @@
+[package]
+name = "gluon-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Command-line interface for the Gluon build system."
+
+[[bin]]
+name = "gluon"
+path = "src/main.rs"
+
+[dependencies]
+gluon-core.workspace = true

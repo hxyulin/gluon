@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/gluon-core", "crates/gluon-cli"]
+default-members = ["crates/gluon-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/hxyulin/gluon"
+rust-version = "1.85"
+
+[workspace.dependencies]
+gluon-core = { path = "crates/gluon-core" }
