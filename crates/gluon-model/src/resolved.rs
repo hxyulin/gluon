@@ -1,3 +1,12 @@
+//! Post-resolution types consumed by the scheduler and compile pipeline.
+//!
+//! After the engine evaluates `gluon.rhai` and the user selects a profile,
+//! [`crate::build_model::BuildModel`] is collapsed into a
+//! [`ResolvedConfig`]: profile inheritance is applied, config options are
+//! resolved to final typed values, and crate/target bindings are frozen.
+//! Everything downstream of resolution works with these types, never with
+//! the raw build model directly.
+
 use crate::build_model::{CrateDef, ProjectDef, TargetDef};
 use crate::handle::Handle;
 use serde::{Deserialize, Serialize};

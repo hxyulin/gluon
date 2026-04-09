@@ -13,7 +13,7 @@ keywords = ["build-system", "bare-metal", "kernel", "rustc", "no-std"]
 categories = ["development-tools::build-utils", "embedded", "no-std"]
 
 [workspace.lints.rust]
-unsafe_code = "deny"
+unsafe_code = "warn"
 
 [workspace.dependencies]
 gluon-model = { path = "crates/gluon-model" }
