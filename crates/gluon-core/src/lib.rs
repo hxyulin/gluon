@@ -5,8 +5,10 @@
 //! engine, scheduler, compile, cache, and sysroot modules will be added
 //! in subsequent implementation chunks.
 
+pub mod engine;
 pub mod error;
 
+pub use engine::evaluate_script;
 pub use error::{Diagnostic, Error, Level, Result};
 
 // Re-export the model crate for convenience — embedders can use either
