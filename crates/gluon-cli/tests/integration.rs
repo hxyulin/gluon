@@ -694,3 +694,103 @@ fn rustfmt_available() -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
+
+// ---------------------------------------------------------------------------
+// Multi-profile fixture: model-level evaluation tests
+// ---------------------------------------------------------------------------
+
+/// Resolve the multi-profile fixture path.
+fn multi_profile_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/gluon-cli has a two-level parent")
+        .join("tests")
+        .join("fixtures")
+        .join("multi-profile")
+}
+
+/// Evaluate the multi-profile fixture and verify the model captures
+/// multiple profiles, cfg_flags, dependency features, and default_profile.
+///
+/// This test exercises model evaluation only — no rustc probe required —
+/// so it runs in the default (non-`--ignored`) test set.
+#[test]
+fn multi_profile_fixture_model() {
+    let fixture = multi_profile_fixture_dir();
+    let script = fixture.join("gluon.rhai");
+    assert!(
+        script.is_file(),
+        "multi-profile fixture missing at {script:?}"
+    );
+
+    let model = gluon_core::evaluate(&script)
+        .expect("evaluate multi-profile gluon.rhai should succeed");
+
+    // -- Project & default_profile --
+    let project = model.project.as_ref().expect("project should be set");
+    assert_eq!(project.name, "multiprofile_test");
+    assert_eq!(
+        project.default_profile.as_deref(),
+        Some("debug"),
+        "default_profile should be 'debug'"
+    );
+
+    // -- Two profiles --
+    let debug_h = model
+        .profiles
+        .lookup("debug")
+        .expect("model should have a 'debug' profile");
+    let debug = model.profiles.get(debug_h).unwrap();
+    assert_eq!(debug.opt_level, Some(0));
+    assert_eq!(debug.debug_info, Some(true));
+
+    let release_h = model
+        .profiles
+        .lookup("release")
+        .expect("model should have a 'release' profile");
+    let release = model.profiles.get(release_h).unwrap();
+    assert_eq!(release.opt_level, Some(2));
+    assert_eq!(release.debug_info, Some(false));
+    assert_eq!(release.lto.as_deref(), Some("thin"));
+
+    // -- Two groups --
+    assert!(
+        model.groups.lookup("host_tools").is_some(),
+        "model should have a 'host_tools' group"
+    );
+    assert!(
+        model.groups.lookup("kernel").is_some(),
+        "model should have a 'kernel' group"
+    );
+
+    // -- Two crates --
+    assert!(
+        model.crates.lookup("mylib").is_some(),
+        "model should have a 'mylib' crate"
+    );
+    let app_h = model
+        .crates
+        .lookup("app")
+        .expect("model should have an 'app' crate");
+    let app = model.crates.get(app_h).unwrap();
+
+    // -- cfg_flags on app --
+    assert_eq!(
+        app.cfg_flags,
+        vec!["my_feature".to_string(), "test_mode".to_string()],
+        "app should have cfg_flags [my_feature, test_mode]"
+    );
+
+    // -- app depends on mylib with features: ["logging"] --
+    let dep = app
+        .deps
+        .get("mylib")
+        .expect("app should have a dep named 'mylib'");
+    assert_eq!(dep.crate_name, "mylib");
+    assert_eq!(
+        dep.features,
+        vec!["logging".to_string()],
+        "mylib dep should have features [logging]"
+    );
+}
