@@ -6,7 +6,9 @@
 use super::EngineState;
 use rhai::Engine;
 
+pub(super) mod config;
 pub(super) mod model;
+pub(super) mod pipeline;
 
 /// Register a chainable builder method on the Rhai engine.
 ///
@@ -88,4 +90,6 @@ pub(super) fn register_all(engine: &mut Engine, state: &EngineState) {
     engine.register_global_module(rhai::Shared::new(module));
 
     model::register(engine, state);
+    config::register(engine, state);
+    pipeline::register(engine, state);
 }

@@ -30,6 +30,13 @@ pub(crate) struct EngineState {
     pub(crate) model: Rc<RefCell<BuildModel>>,
     pub(crate) diagnostics: Rc<RefCell<Vec<Diagnostic>>>,
     pub(crate) script_file: Rc<PathBuf>,
+    /// Sidecar singleton flag for `qemu()`. `BuildModel::qemu` is a
+    /// non-`Option` `QemuDef` with a default value, so we can't tell from
+    /// the model alone whether the script has called `qemu()` already.
+    pub(crate) qemu_defined: Rc<RefCell<bool>>,
+    /// Sidecar singleton flag for `bootloader()`; same rationale as
+    /// [`Self::qemu_defined`].
+    pub(crate) bootloader_defined: Rc<RefCell<bool>>,
 }
 
 impl EngineState {
@@ -38,6 +45,8 @@ impl EngineState {
             model: Rc::new(RefCell::new(BuildModel::default())),
             diagnostics: Rc::new(RefCell::new(Vec::new())),
             script_file: Rc::new(script_file),
+            qemu_defined: Rc::new(RefCell::new(false)),
+            bootloader_defined: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -317,6 +326,272 @@ mod tests {
         assert_eq!(
             kernel.default_edition, "2024",
             "first definition's edition should be preserved"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Chunk 3: config + pipeline + rule + qemu + bootloader builders
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn config_bool_basic() {
+        let f = write_script(
+            r#"
+            project("t", "0.1.0");
+            config_bool("CONFIG_FOO").default_value(true).help("helpful");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let opt = model
+            .config_options
+            .get("CONFIG_FOO")
+            .expect("option registered");
+        assert_eq!(opt.ty, gluon_model::ConfigType::Bool);
+        match opt.default {
+            gluon_model::ConfigValue::Bool(true) => {}
+            ref other => panic!("expected Bool(true), got {other:?}"),
+        }
+        assert_eq!(opt.help.as_deref(), Some("helpful"));
+    }
+
+    #[test]
+    fn config_u32_range() {
+        let f = write_script(
+            r#"
+            project("t", "0.1.0");
+            config_u32("CONFIG_SIZE").default_value(4096).range(0, 65536);
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let opt = model
+            .config_options
+            .get("CONFIG_SIZE")
+            .expect("option registered");
+        assert_eq!(opt.ty, gluon_model::ConfigType::U32);
+        match opt.default {
+            gluon_model::ConfigValue::U32(4096) => {}
+            ref other => panic!("expected U32(4096), got {other:?}"),
+        }
+        assert_eq!(opt.range, Some((0, 65536)));
+    }
+
+    #[test]
+    fn config_choice() {
+        let f = write_script(
+            r#"
+            project("t", "0.1.0");
+            config_choice("CONFIG_MODE")
+                .choices(["debug", "release"])
+                .default_value("debug");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let opt = model
+            .config_options
+            .get("CONFIG_MODE")
+            .expect("option registered");
+        assert_eq!(opt.ty, gluon_model::ConfigType::Choice);
+        match &opt.default {
+            gluon_model::ConfigValue::Choice(s) if s == "debug" => {}
+            other => panic!("expected Choice(\"debug\"), got {other:?}"),
+        }
+        assert_eq!(
+            opt.choices.as_deref(),
+            Some(&["debug".to_string(), "release".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn config_type_mismatch_is_diagnostic() {
+        let f = write_script(
+            r#"
+            project("t", "0.1.0");
+            config_bool("CONFIG_FOO").default_value(42);
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter()
+                        .any(|d| d.message.contains("CONFIG_FOO") && d.message.contains("bool")),
+                    "expected type-mismatch diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_config_is_diagnostic() {
+        let f = write_script(
+            r#"
+            project("t", "0.1.0");
+            config_bool("CONFIG_FOO").help("first");
+            config_bool("CONFIG_FOO").help("second");
+            "#,
+        );
+        let (model, diags) = evaluate_script_raw(f.path()).expect("script runs");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("CONFIG_FOO") && d.message.contains("more than once")),
+            "expected duplicate-config diagnostic, got: {diags:#?}"
+        );
+        let opt = model
+            .config_options
+            .get("CONFIG_FOO")
+            .expect("first definition preserved");
+        assert_eq!(
+            opt.help.as_deref(),
+            Some("first"),
+            "first definition's help should be preserved"
+        );
+    }
+
+    #[test]
+    fn preset_basic() {
+        let f = write_script(
+            r#"
+            project("t", "0.1.0");
+            preset("debug").set("CONFIG_FOO", true).set("CONFIG_SIZE", 4096);
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let p = model.presets.get("debug").expect("preset registered");
+        assert_eq!(p.overrides.len(), 2);
+        match p.overrides.get("CONFIG_FOO") {
+            Some(gluon_model::ConfigValue::Bool(true)) => {}
+            other => panic!("expected Bool(true), got {other:?}"),
+        }
+        match p.overrides.get("CONFIG_SIZE") {
+            Some(gluon_model::ConfigValue::U64(4096)) => {}
+            other => panic!("expected U64(4096), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rule_basic() {
+        let f = write_script(
+            r#"
+            project("t", "0.1.0");
+            rule("my_rule")
+                .handler("exec")
+                .inputs(["a", "b"])
+                .outputs(["out.bin"]);
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let h = model.rules.lookup("my_rule").expect("rule exists");
+        let r = model.rules.get(h).unwrap();
+        match &r.handler {
+            gluon_model::RuleHandler::Builtin(s) if s == "exec" => {}
+            other => panic!("expected Builtin(\"exec\"), got {other:?}"),
+        }
+        assert_eq!(r.inputs, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(r.outputs, vec!["out.bin".to_string()]);
+    }
+
+    #[test]
+    fn pipeline_stages() {
+        let f = write_script(
+            r#"
+            project("t", "1");
+            target("x", "t.json");
+            let g = group("kernel").target("x");
+            g.add("k", "crates/k");
+            pipeline().stage("kernel", ["kernel"]);
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        assert_eq!(model.pipelines.len(), 1);
+        let h = model
+            .pipelines
+            .lookup("main")
+            .expect("main pipeline exists");
+        let p = model.pipelines.get(h).unwrap();
+        assert_eq!(p.stages.len(), 1);
+        assert_eq!(p.stages[0].name, "kernel");
+        assert_eq!(p.stages[0].inputs, vec!["kernel".to_string()]);
+    }
+
+    #[test]
+    fn qemu_stub() {
+        let f = write_script(
+            r#"
+            project("t", "0.1.0");
+            qemu().machine("q35").memory(512).cores(4);
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        assert_eq!(
+            model.qemu.extras.get("machine").map(String::as_str),
+            Some("q35")
+        );
+        assert_eq!(
+            model.qemu.extras.get("memory").map(String::as_str),
+            Some("512")
+        );
+        assert_eq!(
+            model.qemu.extras.get("cores").map(String::as_str),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn bootloader_stub() {
+        let f = write_script(
+            r#"
+            project("t", "0.1.0");
+            bootloader("generic-uefi");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        assert_eq!(model.bootloader.kind, "generic-uefi");
+    }
+
+    #[test]
+    fn duplicate_qemu_is_diagnostic() {
+        let f = write_script(
+            r#"
+            project("test", "0.1.0");
+            qemu().machine("q35");
+            qemu().machine("pc");
+            "#,
+        );
+        let (model, diags) = evaluate_script_raw(f.path()).expect("script runs");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("qemu") && d.message.contains("more than once")),
+            "expected duplicate qemu diagnostic, got: {diags:#?}"
+        );
+        assert_eq!(
+            model.qemu.extras.get("machine").map(String::as_str),
+            Some("q35"),
+            "first qemu definition's machine should be preserved"
+        );
+    }
+
+    #[test]
+    fn duplicate_bootloader_is_diagnostic() {
+        let f = write_script(
+            r#"
+            project("test", "0.1.0");
+            bootloader("foo");
+            bootloader("bar");
+            "#,
+        );
+        let (model, diags) = evaluate_script_raw(f.path()).expect("script runs");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("bootloader") && d.message.contains("more than once")),
+            "expected duplicate bootloader diagnostic, got: {diags:#?}"
+        );
+        assert_eq!(
+            model.bootloader.kind, "foo",
+            "first bootloader definition's kind should be preserved"
         );
     }
 

@@ -4,8 +4,8 @@
 
 use super::EngineState;
 use crate::error::Diagnostic;
-use gluon_model::DepDef;
-use rhai::{Map, Position};
+use gluon_model::{ConfigType, ConfigValue, DepDef, TristateVal};
+use rhai::{Dynamic, Map, Position};
 use std::collections::BTreeMap;
 
 // TODO: restore `optional` and `default_features` to the allowed keys
@@ -148,6 +148,187 @@ pub(super) fn parse_dep_map(
     }
 
     out
+}
+
+/// Strict-convert a Rhai [`Dynamic`] into a typed [`ConfigValue`] for the
+/// given [`ConfigType`].
+///
+/// Unlike the upstream fall-through conversion, this is *typed by expectation*:
+/// the caller declares which `ConfigType` is expected and the function pushes
+/// a diagnostic and returns `None` if the dynamic doesn't match.
+pub(super) fn dynamic_to_config_value(
+    state: &EngineState,
+    pos: Position,
+    option_name: &str,
+    expected: &ConfigType,
+    value: Dynamic,
+) -> Option<ConfigValue> {
+    let observed = value.type_name();
+    let mismatch = |state: &EngineState, expected_str: &str| {
+        state.push_diagnostic(
+            Diagnostic::error(format!(
+                "config option '{option_name}': expected {expected_str} value, got {observed}"
+            ))
+            .with_span(state.span_from(pos)),
+        );
+    };
+
+    match expected {
+        ConfigType::Bool => match value.as_bool() {
+            Ok(b) => Some(ConfigValue::Bool(b)),
+            Err(_) => {
+                mismatch(state, "bool");
+                None
+            }
+        },
+        ConfigType::U32 => match value.as_int() {
+            Ok(i) if (0..=u32::MAX as i64).contains(&i) => Some(ConfigValue::U32(i as u32)),
+            Ok(i) => {
+                state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "config option '{option_name}': value {i} out of range for u32"
+                    ))
+                    .with_span(state.span_from(pos)),
+                );
+                None
+            }
+            Err(_) => {
+                mismatch(state, "u32");
+                None
+            }
+        },
+        ConfigType::U64 => match value.as_int() {
+            Ok(i) if i >= 0 => Some(ConfigValue::U64(i as u64)),
+            Ok(i) => {
+                state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "config option '{option_name}': value {i} is negative, expected u64"
+                    ))
+                    .with_span(state.span_from(pos)),
+                );
+                None
+            }
+            Err(_) => {
+                mismatch(state, "u64");
+                None
+            }
+        },
+        ConfigType::Str => match value.into_string() {
+            Ok(s) => Some(ConfigValue::Str(s)),
+            Err(_) => {
+                mismatch(state, "string");
+                None
+            }
+        },
+        ConfigType::Choice => match value.into_string() {
+            Ok(s) => Some(ConfigValue::Choice(s)),
+            Err(_) => {
+                mismatch(state, "string (choice variant name)");
+                None
+            }
+        },
+        ConfigType::List => match value.try_cast::<rhai::Array>() {
+            Some(arr) => match array_to_string_vec(arr) {
+                Ok(v) => Some(ConfigValue::List(v)),
+                Err(msg) => {
+                    state.push_diagnostic(
+                        Diagnostic::error(format!("config option '{option_name}': {msg}"))
+                            .with_span(state.span_from(pos)),
+                    );
+                    None
+                }
+            },
+            None => {
+                mismatch(state, "array of strings");
+                None
+            }
+        },
+        ConfigType::Tristate => match value.into_string() {
+            Ok(s) => match s.as_str() {
+                "y" | "yes" => Some(ConfigValue::Tristate(TristateVal::Yes)),
+                "n" | "no" => Some(ConfigValue::Tristate(TristateVal::No)),
+                "m" | "module" => Some(ConfigValue::Tristate(TristateVal::Module)),
+                _ => {
+                    state.push_diagnostic(
+                        Diagnostic::error(format!(
+                            "config option '{option_name}': tristate must be \"y\", \"n\", or \"m\", got \"{s}\""
+                        ))
+                        .with_span(state.span_from(pos)),
+                    );
+                    None
+                }
+            },
+            Err(_) => {
+                mismatch(state, "tristate string (\"y\"/\"n\"/\"m\")");
+                None
+            }
+        },
+        ConfigType::Group => {
+            state.push_diagnostic(
+                Diagnostic::error(format!(
+                    "config option '{option_name}': cannot set a value on a Group-typed option"
+                ))
+                .with_span(state.span_from(pos)),
+            );
+            None
+        }
+    }
+}
+
+/// Best-effort conversion from a Rhai [`Dynamic`] to a [`ConfigValue`], used
+/// by `preset.set(name, value)` where the expected type is not yet known at
+/// the point of assignment. Values are stored using the closest matching
+/// variant; the resolve pass later re-types them against the actual option's
+/// `ConfigType`.
+pub(super) fn dynamic_to_config_value_best_effort(
+    state: &EngineState,
+    pos: Position,
+    preset_name: &str,
+    option_name: &str,
+    value: Dynamic,
+) -> Option<ConfigValue> {
+    if let Ok(b) = value.as_bool() {
+        return Some(ConfigValue::Bool(b));
+    }
+    if let Ok(i) = value.as_int() {
+        if i >= 0 {
+            return Some(ConfigValue::U64(i as u64));
+        }
+        state.push_diagnostic(
+            Diagnostic::error(format!(
+                "preset '{preset_name}' option '{option_name}': negative integer {i} not allowed"
+            ))
+            .with_span(state.span_from(pos)),
+        );
+        return None;
+    }
+    if let Some(arr) = value.clone().try_cast::<rhai::Array>() {
+        return match array_to_string_vec(arr) {
+            Ok(v) => Some(ConfigValue::List(v)),
+            Err(msg) => {
+                state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "preset '{preset_name}' option '{option_name}': {msg}"
+                    ))
+                    .with_span(state.span_from(pos)),
+                );
+                None
+            }
+        };
+    }
+    let observed = value.type_name();
+    match value.into_string() {
+        Ok(s) => Some(ConfigValue::Str(s)),
+        Err(_) => {
+            state.push_diagnostic(
+                Diagnostic::error(format!(
+                    "preset '{preset_name}' option '{option_name}': unsupported value type {observed}"
+                ))
+                .with_span(state.span_from(pos)),
+            );
+            None
+        }
+    }
 }
 
 /// Convert a Rhai `Array` of strings into `Vec<String>`, or an error message
