@@ -99,6 +99,14 @@ pub(crate) fn build_rustc_command(
     // `-C extra-filename=-gluon-<name>` so rustc writes a deterministic
     // name instead of the default hash-suffixed form — this lets us know
     // the output path without globbing post-spawn.
+    //
+    // Exception: cross Bin crates do NOT use extra-filename. Rustc never
+    // appends a hash suffix to binary outputs (unlike rlibs), and adding
+    // extra-filename to a binary produces an ugly `hello-gluon-hello` name
+    // in the final output directory. The binary is placed directly into
+    // `cross_final_dir` via `--out-dir`; its canonical name is just
+    // `<crate_name>` with no suffix. Dep-info for bins is therefore also
+    // suffix-free: `<crate_name>.d` in `cross_final_dir`.
     let extra_filename = format!("-gluon-{crate_name}");
 
     let (out_dir, output_path, depfile_path) = if crate_ref.host {
@@ -146,18 +154,25 @@ pub(crate) fn build_rustc_command(
 
         match crate_def.crate_type {
             CrateType::Bin => {
-                // Binaries land in the "final" directory without extra-filename.
-                // The binary name matches the crate name.
+                // Cross binaries land directly in `cross_final_dir`. We set
+                // `--out-dir` to `final_dir` (no `-o` override) and do NOT
+                // use `-C extra-filename` for Bin crates. Reasons:
+                //   1. rustc never hash-suffixes binary names, so no
+                //      extra-filename is needed to make the name deterministic.
+                //   2. `-C extra-filename` with `--out-dir` would produce
+                //      `hello-gluon-hello`, which is ugly for a final binary.
+                //   3. Omitting extra-filename keeps the canonical output name
+                //      equal to the crate name, matching user expectations.
+                // The artifact_dir (cross_artifact_dir) is kept for incremental
+                // state; out_dir points to final_dir so the binary lands there.
                 let final_dir = layout.cross_final_dir(target, &resolved.profile);
                 let artifact = final_dir.join(crate_name.as_str());
-                // Depfile is still in the artifact dir (cross_artifact_dir),
-                // because --out-dir is set to the artifact dir and the bin
-                // itself is emitted via -o.
-                let artifact_dir = layout.cross_artifact_dir(target, &resolved.profile, crate_def);
-                let depfile = artifact_dir.join(format!("{crate_name}{extra_filename}.d"));
-                // out_dir for the command is cross_artifact_dir (so deps go there)
-                // but we separately pass -o for the bin output.
-                (artifact_dir, artifact, depfile)
+                // Depfile: without extra-filename, rustc writes `<name>.d`
+                // in the --out-dir (final_dir).
+                let depfile = final_dir.join(format!("{crate_name}.d"));
+                // Use final_dir as out_dir so the binary is placed there.
+                // The incremental dir is set separately via -C incremental=.
+                (final_dir, artifact, depfile)
             }
             _ => {
                 let out_dir = layout.cross_artifact_dir(target, &resolved.profile, crate_def);
@@ -307,18 +322,26 @@ pub(crate) fn build_rustc_command(
         if let Some(ls) = &crate_def.linker_script {
             builder.linker_script(&project_root.join(ls));
         }
-        // For Bin crates, pass -o <final_path> to place the linked binary
-        // in cross_final_dir rather than out_dir.
-        builder.raw_arg("-o").raw_arg(output_path.as_os_str());
+        // Note: we do NOT pass `-o` here for cross Bin crates. We use
+        // `--out-dir=cross_final_dir` instead, and omit `-C extra-filename`
+        // for Bin crates (see the output-path derivation above for rationale).
+        // For host Bin crates (unusual), `-o` is also omitted; they use the
+        // host_artifact_dir as --out-dir with extra-filename.
     }
 
-    // Append -C extra-filename LAST (mirrors sysroot convention). This
-    // must come after all other flags so the hash is stable — any flag
-    // appended after extra-filename would shift its position and change
-    // the cache key.
-    builder
-        .raw_arg("-C")
-        .raw_arg(format!("extra-filename={extra_filename}"));
+    // Append -C extra-filename LAST (mirrors sysroot convention). This must
+    // come after all other flags so the canonical token order (and therefore
+    // the cache hash) stays stable.
+    //
+    // Exception: cross Bin crates skip extra-filename entirely. See the
+    // output-path derivation comment above for the full rationale. The `if`
+    // here ensures the cache key is still stable — the absence of the flag for
+    // Bin crates is part of the canonical token order.
+    if crate_def.crate_type != CrateType::Bin || crate_ref.host {
+        builder
+            .raw_arg("-C")
+            .raw_arg(format!("extra-filename={extra_filename}"));
+    }
 
     Ok((builder, output_path, depfile_path))
 }
@@ -409,22 +432,15 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<PathBuf
     let out_dir = if crate_ref.host {
         ctx.layout.host_artifact_dir(crate_def)
     } else if crate_def.crate_type == CrateType::Bin {
-        // For bin crates, we need both the artifact dir and the final dir.
+        // Cross Bin crates use cross_final_dir as --out-dir (see
+        // build_rustc_command comment). Create it here before spawning rustc.
         let target = model.targets.get(crate_ref.target).ok_or_else(|| {
             Error::Compile(format!(
-                "crate '{}': target handle not found when creating output directories",
+                "crate '{}': target handle not found when creating output directory",
                 crate_name
             ))
         })?;
-        let artifact_dir = ctx
-            .layout
-            .cross_artifact_dir(target, &resolved.profile, crate_def);
-        let final_dir = ctx.layout.cross_final_dir(target, &resolved.profile);
-        fs::create_dir_all(&final_dir).map_err(|e| Error::Io {
-            path: final_dir.clone(),
-            source: e,
-        })?;
-        artifact_dir
+        ctx.layout.cross_final_dir(target, &resolved.profile)
     } else {
         let target = model.targets.get(crate_ref.target).ok_or_else(|| {
             Error::Compile(format!(
@@ -530,7 +546,11 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<PathBuf
 ///
 /// Lowercases every character and replaces any byte that is not `[a-z0-9_]`
 /// with `_`. The result is suitable as a crate name or the prefix of one.
-fn sanitise_crate_name(s: &str) -> String {
+///
+/// `pub(crate)` so that `scheduler::helpers::config_crate` can reuse this
+/// logic without duplication — both places derive config-crate names from
+/// the project name using the same rules.
+pub(crate) fn sanitise_crate_name(s: &str) -> String {
     s.chars()
         .map(|c| {
             let lc = c.to_ascii_lowercase();
@@ -1204,6 +1224,71 @@ mod tests {
             result.unwrap(),
             output_path,
             "cache hit must return output_path"
+        );
+    }
+
+    /// Regression guard: cross Bin crates must NOT emit `-C extra-filename` or
+    /// `-o`, and the output path must end with just the crate name (no
+    /// `-gluon-<name>` suffix). This exercises the special-case code in
+    /// `build_rustc_command` that keeps cross binary names clean.
+    #[test]
+    fn flag_assembly_cross_bin_omits_extra_filename_and_uses_out_dir_in_final() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = make_ctx(tmp.path(), "/usr/bin/rustc");
+        let sysroot_dir = tmp.path().join("sysroot");
+
+        let mut model = BuildModel::default();
+        let th = insert_target(&mut model, make_target("x86", "x86_64-unknown-none", true));
+        let ch = insert_crate(
+            &mut model,
+            CrateDef {
+                name: "hello".into(),
+                path: "crates/hello".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Bin,
+                ..Default::default()
+            },
+        );
+        let resolved = make_resolved(th, tmp.path().to_path_buf());
+        let crate_ref = cross_ref(ch, th);
+        let artifacts = ArtifactMap::new();
+
+        let (builder, output_path, _depfile) = build_rustc_command(
+            &ctx,
+            &CompileCrateInput {
+                model: &model,
+                resolved: &resolved,
+                crate_ref: &crate_ref,
+                artifacts: &artifacts,
+                sysroot_dir: Some(&sysroot_dir),
+            },
+        )
+        .unwrap();
+
+        let args: Vec<String> = builder
+            .args()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "-C" && w[1].contains("extra-filename")),
+            "cross Bin must not emit -C extra-filename, got: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-o"),
+            "cross Bin must not emit -o, got: {args:?}"
+        );
+
+        // Output should be at <cross_final_dir>/hello, not <...>/hello-gluon-hello.
+        assert!(
+            output_path.ends_with("hello"),
+            "output path should end with crate name, got: {output_path:?}"
+        );
+        assert!(
+            !output_path.to_string_lossy().contains("-gluon-"),
+            "output path should not contain -gluon- suffix, got: {output_path:?}"
         );
     }
 

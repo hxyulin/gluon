@@ -24,9 +24,44 @@ pub use engine::evaluate_script;
 pub use error::{Diagnostic, Error, Level, Result};
 pub use rule::builtin::ExecRule;
 pub use rule::{RuleCtx, RuleFn, RuleRegistry};
-pub use scheduler::{Dag, DagNode, JobDispatcher, NodeId, WorkerPool, build_dag};
+pub use scheduler::{Dag, DagNode, JobDispatcher, NodeId, WorkerPool, build_dag, execute_pipeline};
 pub use sysroot::ensure_sysroot;
 
 // Re-export the model crate for convenience — embedders can use either
 // `gluon_core::model::BuildModel` or `gluon_model::BuildModel`.
 pub use gluon_model as model;
+
+/// Top-level build entry point. Builds the DAG, runs the scheduler,
+/// and persists the cache manifest on success. Uses the default set of
+/// built-in rules (`RuleRegistry::with_builtins`) and the host's
+/// parallelism from `std::thread::available_parallelism` (fallback 1).
+pub fn build(
+    ctx: &CompileCtx,
+    model: &gluon_model::BuildModel,
+    resolved: &gluon_model::ResolvedConfig,
+) -> Result<()> {
+    let rules = rule::RuleRegistry::with_builtins();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    scheduler::execute_pipeline(
+        ctx,
+        model,
+        resolved,
+        &rules,
+        workers,
+        &mut stdout,
+        &mut stderr,
+    )?;
+    // Persist the cache on success so the next run benefits from this build's
+    // freshness records. On failure we intentionally skip the save — a partial
+    // build's cache entries are written eagerly inside the per-node helpers, so
+    // any nodes that succeeded are already recorded.
+    ctx.cache
+        .lock()
+        .map_err(|_| Error::Config("cache mutex poisoned".into()))?
+        .save()?;
+    Ok(())
+}
