@@ -1,0 +1,10 @@
+# Ignore everything by default
+*
+
+# Commit this gitignore itself
+!.gitignore
+
+# Commit hooks and skills (shared project config)
+!settings.json
+!skills/
+!skills/**
