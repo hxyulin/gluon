@@ -19,7 +19,7 @@ pub fn ensure_sysroot_for_node(
     model: &BuildModel,
     target: Handle<TargetDef>,
     _stdout: &mut Vec<u8>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, bool)> {
     let target_def = model.targets.get(target).ok_or_else(|| {
         Error::Compile(format!(
             "scheduler: Sysroot node references target handle {target:?} not found in build model"

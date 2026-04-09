@@ -347,8 +347,10 @@ pub(crate) fn build_rustc_command(
 }
 
 /// Compile a single crate. Returns the absolute path of the produced
-/// artifact. Cached via `ctx.cache` following the narrow-lock pattern
-/// established by `sysroot::build_sysroot_crate`.
+/// artifact and a boolean indicating whether the result came from the
+/// cache (`true` = freshness check short-circuited rustc). Cached via
+/// `ctx.cache` following the narrow-lock pattern established by
+/// `sysroot::build_sysroot_crate`.
 ///
 /// ### Cache contract
 ///
@@ -358,7 +360,7 @@ pub(crate) fn build_rustc_command(
 ///
 /// **Never hold the cache lock across a rustc spawn** — doing so would
 /// serialise parallel compilation on the cache mutex.
-pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<PathBuf> {
+pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<(PathBuf, bool)> {
     let model = input.model;
     let resolved = input.resolved;
     let crate_ref = input.crate_ref;
@@ -419,7 +421,7 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<PathBuf
     };
 
     if is_fresh && output_path.exists() {
-        return Ok(output_path);
+        return Ok((output_path, true));
     }
 
     // Slow path: create the output directory and spawn rustc.
@@ -539,7 +541,7 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<PathBuf
         })?;
     }
 
-    Ok(output_path)
+    Ok((output_path, false))
 }
 
 /// Sanitise an arbitrary string to a valid Rust identifier component.
@@ -1220,11 +1222,9 @@ mod tests {
                 sysroot_dir: None,
             },
         );
-        assert_eq!(
-            result.unwrap(),
-            output_path,
-            "cache hit must return output_path"
-        );
+        let (got_path, was_cached) = result.unwrap();
+        assert_eq!(got_path, output_path, "cache hit must return output_path");
+        assert!(was_cached, "cache hit must report was_cached=true");
     }
 
     /// Regression guard: cross Bin crates must NOT emit `-C extra-filename` or
@@ -1341,7 +1341,8 @@ mod tests {
             },
         );
 
-        let output_path = result.expect("compile should succeed");
+        let (output_path, was_cached) = result.expect("compile should succeed");
+        assert!(!was_cached, "first build must not report cached");
         assert!(output_path.exists(), "rlib must exist at {output_path:?}");
         assert!(
             std::fs::metadata(&output_path).unwrap().len() > 0,

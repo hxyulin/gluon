@@ -62,6 +62,31 @@ use std::sync::mpsc;
 // JobDispatcher
 // ---------------------------------------------------------------------------
 
+/// Aggregate counts produced by [`crate::scheduler::execute_pipeline`] and
+/// surfaced through [`crate::build`].
+///
+/// - `built` counts nodes that ran their underlying action (rustc, etc.) to
+///   completion this build.
+/// - `cached` counts nodes whose freshness check reported fresh, so the
+///   action was skipped entirely.
+///
+/// Counts are accumulated across **all** pipeline node kinds that go through
+/// a freshness check (sysroot crates, the generated config crate, and
+/// user-declared crates). `Rule` nodes are **not** counted — they are not
+/// cacheable in MVP-M.
+///
+/// This exists so that the CLI and integration tests can rely on a single
+/// concrete cache-hit signal rather than scraping per-job stdout — the
+/// alternative we explicitly rejected because it is fragile.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildSummary {
+    /// Number of cacheable steps that ran rustc to completion this build.
+    pub built: usize,
+    /// Number of cacheable steps that were already fresh in the cache and
+    /// therefore skipped rustc entirely.
+    pub cached: usize,
+}
+
 /// Per-node execution closure.
 ///
 /// Each call receives the `NodeId` (the dispatcher looks up the `DagNode`
@@ -69,8 +94,6 @@ use std::sync::mpsc;
 /// buffers instead of directly to stdout/stderr prevents parallel jobs from
 /// interleaving their compiler messages — the worker pool drains the buffers
 /// to the sinks as each job completes.
-///
-/// ### Safety (`Sync` requirement)
 ///
 /// `JobDispatcher: Sync` because `thread::scope` workers borrow a shared
 /// `&dyn JobDispatcher` immutably from multiple threads concurrently. The

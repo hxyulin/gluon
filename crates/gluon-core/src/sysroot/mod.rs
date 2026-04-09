@@ -44,11 +44,17 @@ use gluon_model::{CrateType, TargetDef};
 use std::path::{Path, PathBuf};
 
 /// Ensure a usable custom sysroot exists for `target` and return its
-/// directory.
+/// directory plus whether the result came from the stamp fast-path.
 ///
-/// Returns `ctx.layout.sysroot_dir(target)` on success. See the module
-/// docs for the fast-path/slow-path split.
-pub fn ensure_sysroot(ctx: &CompileCtx, target: &TargetDef) -> Result<PathBuf> {
+/// Returns `(ctx.layout.sysroot_dir(target), was_cached)` on success.
+/// `was_cached` is `true` when the existing stamp file matched the
+/// current toolchain version (no rustc spawned). See the module docs for
+/// the fast-path/slow-path split.
+///
+/// The `was_cached` flag is consumed by the scheduler and surfaced via
+/// [`crate::BuildSummary`] so the CLI can report a single accurate
+/// `built N, cached M` line per build.
+pub fn ensure_sysroot(ctx: &CompileCtx, target: &TargetDef) -> Result<(PathBuf, bool)> {
     let sysroot_dir = ctx.layout.sysroot_dir(target);
     let sysroot_lib_dir = ctx.layout.sysroot_lib_dir(target);
     let stamp_path = ctx.layout.sysroot_stamp(target);
@@ -68,7 +74,7 @@ pub fn ensure_sysroot(ctx: &CompileCtx, target: &TargetDef) -> Result<PathBuf> {
         // for "the sysroot directory is still intact."
         let core_rlib = sysroot_lib_dir.join("libcore-gluon-core.rlib");
         if sysroot_lib_dir.is_dir() && core_rlib.exists() {
-            return Ok(sysroot_dir);
+            return Ok((sysroot_dir, true));
         }
     }
 
@@ -143,7 +149,7 @@ pub fn ensure_sysroot(ctx: &CompileCtx, target: &TargetDef) -> Result<PathBuf> {
         source: e,
     })?;
 
-    Ok(sysroot_dir)
+    Ok((sysroot_dir, false))
 }
 
 /// Compile a single sysroot crate. Returns the absolute path of the
@@ -486,8 +492,9 @@ mod tests {
 
         let cache = Cache::load(layout.cache_manifest()).expect("load cache");
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
-        let got = ensure_sysroot(&ctx, &target).expect("fast path");
+        let (got, was_cached) = ensure_sysroot(&ctx, &target).expect("fast path");
         assert_eq!(got, sysroot_dir);
+        assert!(was_cached, "stamp fast-path must report was_cached=true");
     }
 
     /// End-to-end sysroot build against the host toolchain. Gated with
@@ -516,7 +523,8 @@ mod tests {
         let expected_hex = hex_encode(&info.version_hash());
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
 
-        let sysroot_dir = ensure_sysroot(&ctx, &target).expect("first build");
+        let (sysroot_dir, first_cached) = ensure_sysroot(&ctx, &target).expect("first build");
+        assert!(!first_cached, "first build must not report was_cached=true");
         let lib_dir = ctx.layout.sysroot_lib_dir(&target);
         for crate_name in ["core", "compiler_builtins", "alloc"] {
             let rlib = lib_dir.join(format!("lib{crate_name}-gluon-{crate_name}.rlib"));
@@ -531,9 +539,10 @@ mod tests {
         // instant. 100ms is a generous upper bound for a single
         // `fs::read` + string compare.
         let start = Instant::now();
-        let sysroot_dir2 = ensure_sysroot(&ctx, &target).expect("second build");
+        let (sysroot_dir2, second_cached) = ensure_sysroot(&ctx, &target).expect("second build");
         let elapsed = start.elapsed();
         assert_eq!(sysroot_dir, sysroot_dir2);
+        assert!(second_cached, "second build must hit the stamp fast path");
         assert!(elapsed.as_millis() < 100, "fast path too slow: {elapsed:?}");
     }
 
@@ -568,7 +577,7 @@ mod tests {
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
 
         let sysroot_dir = match ensure_sysroot(&ctx, &target) {
-            Ok(d) => d,
+            Ok((d, _was_cached)) => d,
             Err(e) => {
                 eprintln!("downstream-link e2e skipped: sysroot build failed: {e:?}");
                 return;

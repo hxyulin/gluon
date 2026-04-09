@@ -168,7 +168,8 @@ pub(crate) fn render_source(resolved: &ResolvedConfig) -> Result<String> {
 
 /// Ensure the generated `<project>_config` crate is compiled and cached.
 ///
-/// Returns `(crate_name, rlib_path)`.
+/// Returns `(crate_name, rlib_path, was_cached)`. `was_cached` is `true`
+/// when the cache freshness check short-circuited rustc entirely.
 ///
 /// ### Source writing discipline
 ///
@@ -188,7 +189,7 @@ pub fn ensure_config_crate(
     resolved: &ResolvedConfig,
     sysroot_dir: &Path,
     _stdout: &mut Vec<u8>,
-) -> Result<(String, PathBuf)> {
+) -> Result<(String, PathBuf, bool)> {
     let layout = &ctx.layout;
 
     // Resolve the cross target for the config crate.
@@ -308,7 +309,7 @@ pub fn ensure_config_crate(
     };
 
     if is_fresh && output_path.exists() {
-        return Ok((crate_name, output_path));
+        return Ok((crate_name, output_path, true));
     }
 
     // Slow path: create the output directory and spawn rustc.
@@ -384,7 +385,7 @@ pub fn ensure_config_crate(
         })?;
     }
 
-    Ok((crate_name, output_path))
+    Ok((crate_name, output_path, false))
 }
 
 // ---------------------------------------------------------------------------

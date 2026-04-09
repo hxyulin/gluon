@@ -18,7 +18,7 @@ pub mod helpers;
 pub mod worker;
 
 pub use dag::{Dag, DagNode, NodeId, build_dag};
-pub use worker::{JobDispatcher, WorkerPool};
+pub use worker::{BuildSummary, JobDispatcher, WorkerPool};
 
 use crate::compile::{ArtifactMap, CompileCrateInput, CompileCtx, compile_crate};
 use crate::error::{Error, Result};
@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // PipelineDispatcher
@@ -52,6 +53,22 @@ struct PipelineDispatcher<'a> {
     /// Built crate artifact paths. Written by `ConfigCrate` and `Crate`
     /// nodes; read (snapshotted) by each `Crate` node before compiling.
     artifacts: &'a Mutex<ArtifactMap>,
+    /// Lock-free counter for nodes that ran rustc to completion.
+    /// `Rule` nodes are not counted (they are not cacheable in MVP-M).
+    built: &'a AtomicUsize,
+    /// Lock-free counter for nodes that returned via the cache fast-path.
+    cached: &'a AtomicUsize,
+}
+
+impl<'a> PipelineDispatcher<'a> {
+    /// Increment the appropriate counter for a cacheable node.
+    fn record(&self, was_cached: bool) {
+        if was_cached {
+            self.cached.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.built.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl<'a> JobDispatcher for PipelineDispatcher<'a> {
@@ -62,13 +79,14 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
             // Sysroot — build the custom sysroot for the target triple.
             // ------------------------------------------------------------------
             DagNode::Sysroot(target) => {
-                let path = helpers::sysroot::ensure_sysroot_for_node(
+                let (path, was_cached) = helpers::sysroot::ensure_sysroot_for_node(
                     self.ctx, self.model, target, stdout,
                 )?;
                 self.sysroots
                     .lock()
                     .map_err(|_| Error::Config("scheduler: sysroots mutex poisoned".into()))?
                     .insert(target, path);
+                self.record(was_cached);
                 Ok(())
             }
 
@@ -94,7 +112,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                             )
                         })?
                 };
-                let (_name, rlib_path) = helpers::config_crate::ensure_config_crate(
+                let (_name, rlib_path, was_cached) = helpers::config_crate::ensure_config_crate(
                     self.ctx,
                     self.model,
                     self.resolved,
@@ -105,6 +123,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                     .lock()
                     .map_err(|_| Error::Config("scheduler: artifacts mutex poisoned".into()))?
                     .set_config_crate(rlib_path);
+                self.record(was_cached);
                 Ok(())
             }
 
@@ -158,7 +177,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                     .map_err(|_| Error::Config("scheduler: artifacts mutex poisoned".into()))?
                     .clone();
 
-                let out_path = compile_crate(
+                let (out_path, was_cached) = compile_crate(
                     self.ctx,
                     CompileCrateInput {
                         model: self.model,
@@ -173,6 +192,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                     .lock()
                     .map_err(|_| Error::Config("scheduler: artifacts mutex poisoned".into()))?
                     .insert(crate_handle, out_path);
+                self.record(was_cached);
                 let _ = stdout;
                 let _ = stderr; // output buffering: future work
                 Ok(())
@@ -182,6 +202,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
             // Rule — run a user-declared rule through the registry.
             // ------------------------------------------------------------------
             DagNode::Rule(rule_handle) => {
+                // Rule nodes are not cacheable in MVP-M — no counter update.
                 let rule = self.model.rules.get(rule_handle).ok_or_else(|| {
                     Error::Compile(format!(
                         "scheduler: Rule node references handle {:?} not in model.rules",
@@ -232,11 +253,17 @@ pub fn execute_pipeline(
     workers: usize,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-) -> Result<()> {
+) -> Result<BuildSummary> {
     let dag = build_dag(resolved, model)?;
 
     let sysroots: Mutex<BTreeMap<Handle<TargetDef>, PathBuf>> = Mutex::new(BTreeMap::new());
     let artifacts: Mutex<ArtifactMap> = Mutex::new(ArtifactMap::new());
+    // `Relaxed` is sufficient: we only need atomicity, not ordering
+    // relative to other memory operations. The counters are read once
+    // after `pool.execute` returns (a happens-before point already
+    // established by the worker-pool join).
+    let built = AtomicUsize::new(0);
+    let cached = AtomicUsize::new(0);
 
     let dispatcher = PipelineDispatcher {
         ctx,
@@ -246,10 +273,17 @@ pub fn execute_pipeline(
         dag: &dag,
         sysroots: &sysroots,
         artifacts: &artifacts,
+        built: &built,
+        cached: &cached,
     };
 
     let pool = WorkerPool::new(workers);
-    pool.execute(&dag, &dispatcher, stdout, stderr)
+    pool.execute(&dag, &dispatcher, stdout, stderr)?;
+
+    Ok(BuildSummary {
+        built: built.load(Ordering::Relaxed),
+        cached: cached.load(Ordering::Relaxed),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +482,7 @@ mod tests {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
 
-        execute_pipeline(
+        let _summary = execute_pipeline(
             &ctx,
             &model,
             &resolved,
