@@ -287,6 +287,7 @@ dependencies = [
  "anyhow",
  "clap",
  "gluon-core",
+ "serde_json",
  "tempfile",
 ]
 

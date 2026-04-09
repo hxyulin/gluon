@@ -21,27 +21,19 @@ fn main() {
 fn run() -> Result<()> {
     let cli = cli::Cli::parse();
 
-    // External subcommands dispatch before building any context — they
+    // External subcommands dispatch before building the context — they
     // may be invoked outside any gluon project, so they don't need a
     // project root or an evaluated build model.
     if let cli::Command::External(args) = cli.command {
         return cmd::external::run(args);
     }
 
-    // `clean` takes the lighter layout-only context (no rustc probe)
-    // so it still works when the toolchain is broken or missing.
-    if let cli::Command::Clean(args) = &cli.command {
-        let ctx = cmd::build_layout_context(cli.profile.as_deref(), cli.target.as_deref())?;
-        return cmd::clean::run(ctx, args.keep_sysroot);
-    }
-
     let ctx = cmd::build_context(cli.profile.as_deref(), cli.target.as_deref())?;
 
     match cli.command {
         cli::Command::Build(_) => cmd::build::run(ctx, cli.jobs),
+        cli::Command::Clean(args) => cmd::clean::run(ctx, args.keep_sysroot),
         cli::Command::Configure(args) => cmd::configure::run(ctx, args.output),
-        cli::Command::Clean(_) | cli::Command::External(_) => {
-            unreachable!("handled above")
-        }
+        cli::Command::External(_) => unreachable!("handled above"),
     }
 }

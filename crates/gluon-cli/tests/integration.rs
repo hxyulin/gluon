@@ -1,6 +1,6 @@
 //! End-to-end CLI integration tests for `gluon-cli`.
 //!
-//! These tests spawn the real `gluon` binary (via `env!("CARGO_BIN_EXE_gluon")`)
+//! These tests spawn the real `gluon` binary (via `env!("CARGO_BIN_EXE_gluon-cli")`)
 //! against a copy of `tests/fixtures/minimal/` that has been recursively
 //! copied into a `tempfile::TempDir`. Running against a copy (rather than
 //! the on-disk fixture in the source tree) keeps the workspace clean: no
@@ -9,22 +9,22 @@
 //!
 //! ## What's `#[ignore]`-gated and why
 //!
-//! Tests that reach `gluon-cli`'s `build_context` path — `gluon build`
-//! and `gluon configure` — call `RustcInfo::load_or_probe`, which
-//! spawns `rustc -vV`. `gluon build` also needs the `rust-src`
-//! component to build the custom sysroot. Spawning rustc (let alone
-//! building core/alloc) isn't acceptable in every CI sandbox, so
-//! those tests are `#[ignore]`-gated and use `require_rustc_or_skip`
-//! to *skip* rather than fail when the toolchain is unavailable.
+//! Any test path that flows through `gluon-cli`'s `build_context` — i.e.
+//! `gluon build`, `gluon clean`, `gluon configure` — ends up calling
+//! `RustcInfo::load_or_probe`, which spawns `rustc -vV`. Spawning `rustc`
+//! is not acceptable in every CI sandbox, and the rustc toolchain also
+//! needs the `rust-src` component to build our custom sysroot. So any
+//! test that reaches `build_context` is gated with `#[ignore]` and uses
+//! the `require_rustc_or_skip` helper so `cargo test --ignored` on a
+//! machine without `rust-src` will *skip* the test rather than fail it.
 //! This mirrors the probe-or-skip + `#[ignore]` pattern used by the
 //! scheduler end-to-end tests in `gluon-core`.
 //!
-//! Tests that do **not** require rustc run in the default suite:
-//!   - The Rhai-diagnostic test deliberately corrupts the script so
-//!     that `evaluate()` fails before any rustc probe.
-//!   - The `gluon clean` tests use `build_layout_context`, which
-//!     stops short of the rustc probe — `clean` should work on
-//!     machines with broken or missing toolchains.
+//! The one test that is **not** `#[ignore]`-gated is the Rhai-diagnostic
+//! test, which deliberately corrupts the script in the tempdir so that
+//! `evaluate()` fails during `build_context`, before the rustc probe runs.
+//! That test exercises the CLI's end-to-end error-reporting path without
+//! needing a real toolchain.
 
 use std::fs;
 use std::io;
@@ -359,10 +359,13 @@ fn gluon_configure_emits_valid_json() {
 
 /// `gluon clean` (default: no `--keep-sysroot`) must remove the entire
 /// `build/` directory. We pre-populate it with a sentinel file so we can
-/// confirm the sweep actually ran. Runs without rustc because `clean`
-/// uses the layout-only context.
+/// confirm the sweep actually ran.
 #[test]
+#[ignore]
 fn gluon_clean_removes_build_dir() {
+    let Some(()) = require_rustc_or_skip("gluon_clean_removes_build_dir") else {
+        return;
+    };
     let (_tmp, fixture) = setup_fixture();
 
     let build_dir = fixture.join("build");
@@ -388,10 +391,13 @@ fn gluon_clean_removes_build_dir() {
 }
 
 /// `gluon clean --keep-sysroot` must remove build state but leave the
-/// sysroot subtree intact. Runs without rustc because `clean` uses
-/// the layout-only context.
+/// sysroot subtree intact.
 #[test]
+#[ignore]
 fn gluon_clean_keep_sysroot_preserves_sysroot() {
+    let Some(()) = require_rustc_or_skip("gluon_clean_keep_sysroot_preserves_sysroot") else {
+        return;
+    };
     let (_tmp, fixture) = setup_fixture();
 
     // Fabricate a fake pre-built state: a sysroot stamp plus some other
