@@ -88,6 +88,13 @@ pub enum Command {
     Clean(CleanArgs),
     /// Generate `rust-project.json` for rust-analyzer.
     Configure(ConfigureArgs),
+    /// Vendor external dependencies declared in `gluon.rhai`.
+    ///
+    /// Synthesises a scratch `Cargo.toml`, invokes `cargo vendor` to
+    /// populate `./vendor/`, and writes `gluon.lock` pinning the
+    /// result. `--check` verifies the existing lock without touching
+    /// disk; `--force` bypasses the fingerprint-match fast path.
+    Vendor(VendorArgs),
     /// Dispatch to an external `gluon-<name>` binary on `$PATH`.
     ///
     /// Clap's `external_subcommand` captures everything after the
@@ -134,6 +141,28 @@ pub struct ConfigureArgs {
     /// Output path for `rust-project.json` (default: `<project_root>/rust-project.json`).
     #[arg(short, long)]
     pub output: Option<PathBuf>,
+}
+
+/// Arguments for `gluon vendor`.
+#[derive(clap::Args, Debug)]
+pub struct VendorArgs {
+    /// Verify the existing vendor tree without modifying anything.
+    ///
+    /// Exits with a non-zero status if `gluon.lock` is missing, its
+    /// fingerprint disagrees with the declared deps, or any vendored
+    /// crate's on-disk checksum has drifted.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Ignore the fingerprint-match fast path and re-run `cargo
+    /// vendor` unconditionally. Useful after hand-editing `vendor/`.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Pass `--offline` / `--frozen` through to cargo. Forbids any
+    /// network access; expects the lockfile to already be up to date.
+    #[arg(long)]
+    pub offline: bool,
 }
 
 #[cfg(test)]
@@ -230,6 +259,40 @@ mod tests {
                 );
             }
             other => panic!("expected Configure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_bare_vendor() {
+        let cli = Cli::try_parse_from(["gluon", "vendor"]).expect("parse");
+        match cli.command {
+            Command::Vendor(a) => {
+                assert!(!a.check);
+                assert!(!a.force);
+                assert!(!a.offline);
+            }
+            other => panic!("expected Vendor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_vendor_check_and_force() {
+        let cli = Cli::try_parse_from(["gluon", "vendor", "--check", "--force"]).expect("parse");
+        match cli.command {
+            Command::Vendor(a) => {
+                assert!(a.check);
+                assert!(a.force);
+            }
+            other => panic!("expected Vendor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_vendor_offline() {
+        let cli = Cli::try_parse_from(["gluon", "vendor", "--offline"]).expect("parse");
+        match cli.command {
+            Command::Vendor(a) => assert!(a.offline),
+            other => panic!("expected Vendor, got {other:?}"),
         }
     }
 

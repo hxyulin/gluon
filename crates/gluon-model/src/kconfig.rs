@@ -69,7 +69,6 @@ pub struct ConfigOptionDef {
     pub ty: ConfigType,
     pub default: ConfigValue,
     pub help: Option<String>,
-    pub depends_on: Vec<String>,
     pub selects: Vec<String>,
     pub range: Option<(u64, u64)>,
     pub choices: Option<Vec<String>>,
@@ -77,22 +76,22 @@ pub struct ConfigOptionDef {
     pub menu: Option<String>,
     /// Code generation bindings for this option.
     pub bindings: Vec<Binding>,
-    /// Symbols that must be enabled for this option to be visible in the TUI.
-    #[serde(default)]
-    pub visible_if: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceSpan>,
-    /// Parsed boolean expression form of `depends_on`, populated by the
-    /// `.kconfig` loader (not by the Rhai builder). When `Some`, the
-    /// resolver evaluates this expression instead of the flat
-    /// `depends_on` `Vec<String>` — the expression form is strictly more
-    /// expressive (supports `||`, `!`, and grouping) whereas the flat
-    /// form is an implicit AND-of-symbols. See `Expr::eval`.
+    /// Parsed boolean expression form of `depends_on`. Both declaration
+    /// surfaces — the `.kconfig` loader and the Rhai `config_*` builder
+    /// — populate this field; there is no other encoding. The resolver
+    /// evaluates it semantically with full `&&` / `||` / `!` / grouping
+    /// support. See [`Expr::eval`].
+    ///
+    /// `None` means "no `depends_on` was declared", which is distinct
+    /// from `Some(Expr::And(vec![]))` (vacuously true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depends_on_expr: Option<Expr>,
     /// Parsed boolean expression form of `visible_if`. TUI-only today —
     /// validated for undeclared references but not evaluated by the
-    /// resolver. Populated by the `.kconfig` loader.
+    /// resolver. Populated by the `.kconfig` loader (the Rhai surface
+    /// has no equivalent method yet).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible_if_expr: Option<Expr>,
 }
@@ -108,16 +107,14 @@ pub struct PresetDef {
 
 /// A boolean expression over config option identifiers.
 ///
-/// Used as the parsed form of `depends_on` and `visible_if` clauses when
-/// loaded from a `.kconfig` file. At resolve time the expression is
-/// evaluated against the current option state — an `Ident` is "true" iff
-/// the referenced option is enabled (per the same `is_on` predicate the
-/// resolver already uses for the flat `Vec<String>` depends form).
-///
-/// `ConfigOptionDef` keeps the flat `Vec<String>` fields alongside these
-/// optional expressions so the Rhai builder — which only knows how to
-/// produce flat dependency lists — continues to work unchanged. When the
-/// expression form is present it takes precedence at resolve time.
+/// This is the sole encoding for `depends_on` and `visible_if` clauses
+/// in [`ConfigOptionDef`]. Both declaration surfaces — the `.kconfig`
+/// loader (`A && !B`-style source grammar) and the Rhai `config_*`
+/// builder (`.depends_on([A, B])` and `.depends_on_expr("A || B")`) —
+/// lower into this enum before the resolver sees it, so there is
+/// exactly one path through `config::resolve`. At resolve time an
+/// `Ident` is "true" iff the referenced option is enabled (per the
+/// `is_on` predicate).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expr {
     /// Reference to another option by name. Evaluates to the value of
@@ -278,22 +275,21 @@ mod tests {
     }
 
     #[test]
-    fn config_option_def_carries_optional_expr_fields() {
-        // depends_on_expr / visible_if_expr default to None and the
-        // existing Vec<String> paths remain the primary form until the
-        // .kconfig loader populates the expression form.
+    fn config_option_def_defaults_to_empty_expr_fields() {
+        // A freshly-constructed `ConfigOptionDef` has `None` for both
+        // `depends_on_expr` and `visible_if_expr` — meaning "no clause
+        // declared", as opposed to `Some(Expr::And(vec![]))` which is
+        // vacuously true.
         let opt = ConfigOptionDef {
             name: "X".into(),
             ty: ConfigType::Bool,
             default: ConfigValue::Bool(false),
             help: None,
-            depends_on: vec![],
             selects: vec![],
             range: None,
             choices: None,
             menu: None,
             bindings: vec![],
-            visible_if: vec![],
             span: None,
             depends_on_expr: None,
             visible_if_expr: None,

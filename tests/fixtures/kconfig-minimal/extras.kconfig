@@ -1,10 +1,20 @@
 # Sourced from `options.kconfig` to exercise file inclusion.
 #
-# `FANCY_FEATURE` uses a true boolean expression — `LOG_ENABLED && !DEBUG`
-# — that the legacy flat `Vec<String>` form cannot represent. The K9
-# parity test does not check this option (the Rhai equivalent omits it
-# because there's no way to write the expression there); the dedicated
-# expression-semantics test in the integration suite does.
+# `FANCY_FEATURE` uses the full boolean-expression grammar
+# (`LOG_ENABLED && !DEBUG`). The K9 parity test uses this option to
+# verify that the Rhai `.depends_on_expr("...")` method reuses the
+# same expression grammar — see `kconfig-rhai-equiv/gluon.rhai` for
+# the equivalent declaration.
+#
+# IMPORTANT: the parity test implicitly depends on this expression
+# evaluating *true* at the fixture's default values
+# (LOG_ENABLED=true, DEBUG=false → `true && !false` → true). If you
+# edit the defaults of LOG_ENABLED or DEBUG in `options.kconfig`,
+# either update this expression in tandem or teach the test to
+# override the referenced options before resolving — otherwise the
+# parity check will silently start comparing FANCY_FEATURE=false
+# against FANCY_FEATURE=false and you'll lose the signal that the
+# expression path is actually being exercised.
 
 config FANCY_FEATURE: bool {
     default = true

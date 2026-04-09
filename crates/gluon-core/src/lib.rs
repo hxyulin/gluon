@@ -19,6 +19,7 @@ pub mod project_root;
 pub mod rule;
 pub mod scheduler;
 pub mod sysroot;
+pub mod vendor;
 
 pub use cache::{BuildRecord, Cache, CacheLock, CacheManifest, FreshnessQuery};
 pub use compile::{

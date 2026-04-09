@@ -7,7 +7,8 @@ use crate::engine::conversions::{
     array_to_string_vec, dynamic_to_config_value, dynamic_to_config_value_best_effort,
 };
 use crate::error::Diagnostic;
-use gluon_model::{Binding, ConfigOptionDef, ConfigType, ConfigValue, PresetDef};
+use crate::kconfig::parse_bool_expr;
+use gluon_model::{Binding, ConfigOptionDef, ConfigType, ConfigValue, Expr, PresetDef};
 use rhai::{Dynamic, Engine, NativeCallContext, Position};
 
 // ---------------------------------------------------------------------------
@@ -78,13 +79,11 @@ fn register_config_ctors(engine: &mut Engine, state: EngineState) {
                                 ty,
                                 default: default_value_for(ty),
                                 help: None,
-                                depends_on: Vec::new(),
                                 selects: Vec::new(),
                                 range: None,
                                 choices: None,
                                 menu: None,
                                 bindings: Vec::new(),
-                                visible_if: Vec::new(),
                                 span: Some(span.clone()),
                                 depends_on_expr: None,
                                 visible_if_expr: None,
@@ -121,6 +120,22 @@ fn register_config_ctors(engine: &mut Engine, state: EngineState) {
 
 /// Neutral initial value for each config type. Overridden by `.default(...)`
 /// on the builder.
+/// AND-merge `added` into an optional `Expr` slot, flattening when the
+/// existing value is already an `And(...)` so repeated
+/// `.depends_on(...)` / `.depends_on_expr(...)` calls fold into a single
+/// level rather than nesting. Matches the cumulative-AND semantics of
+/// the legacy flat `Vec<String>` append path.
+fn and_into(slot: &mut Option<Expr>, added: Expr) {
+    *slot = Some(match slot.take() {
+        None => added,
+        Some(Expr::And(mut xs)) => {
+            xs.push(added);
+            Expr::And(xs)
+        }
+        Some(other) => Expr::And(vec![other, added]),
+    });
+}
+
 fn default_value_for(ty: ConfigType) -> ConfigValue {
     match ty {
         ConfigType::Bool => ConfigValue::Bool(false),
@@ -207,6 +222,11 @@ fn register_config_methods(engine: &mut Engine) {
     );
 
     // depends_on: accept either a single string or an array of strings.
+    //
+    // Both forms AND-fold into `depends_on_expr`, matching what the
+    // `.kconfig` loader produces for an equivalent `depends_on = A && B`
+    // clause. For anything beyond AND-of-names (e.g. `A || !B`), use
+    // `.depends_on_expr("...")` below.
     engine.register_fn(
         "depends_on",
         |builder: &mut ConfigOptionBuilder, dep: rhai::ImmutableString| -> ConfigOptionBuilder {
@@ -215,7 +235,7 @@ fn register_config_methods(engine: &mut Engine) {
             }
             let mut model = builder.state.model.borrow_mut();
             if let Some(opt) = model.config_options.get_mut(&builder.name) {
-                opt.depends_on.push(dep.to_string());
+                and_into(&mut opt.depends_on_expr, Expr::Ident(dep.to_string()));
             }
             builder.clone()
         },
@@ -226,14 +246,44 @@ fn register_config_methods(engine: &mut Engine) {
         ConfigOptionBuilder,
         |state, model, name, pos, list: rhai::Array| {
             match array_to_string_vec(list) {
-                Ok(mut v) => {
+                Ok(v) => {
                     if let Some(opt) = model.config_options.get_mut(name) {
-                        opt.depends_on.append(&mut v);
+                        for dep in v {
+                            and_into(&mut opt.depends_on_expr, Expr::Ident(dep));
+                        }
                     }
                 }
                 Err(msg) => state.push_diagnostic(
                     Diagnostic::error(format!("config option '{name}' depends_on: {msg}"))
                         .with_span(state.span_from(pos)),
+                ),
+            }
+        }
+    );
+
+    // depends_on_expr: accept a mini boolean-expression string using the
+    // same grammar the `.kconfig` parser accepts for `depends_on`/
+    // `visible_if` property values (`&&`, `||`, `!`, `(...)`). Reuses
+    // `kconfig::parse_bool_expr` so there is exactly one grammar across
+    // both declaration surfaces.
+    builder_method!(
+        engine,
+        "depends_on_expr",
+        ConfigOptionBuilder,
+        |state, model, name, pos, expr_src: rhai::ImmutableString| {
+            let origin = state.span_from(pos);
+            match parse_bool_expr(expr_src.as_str(), origin) {
+                Ok(expr) => {
+                    if let Some(opt) = model.config_options.get_mut(name) {
+                        and_into(&mut opt.depends_on_expr, expr);
+                    }
+                }
+                Err(d) => state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "config option '{name}' depends_on_expr: {}",
+                        d.message
+                    ))
+                    .with_optional_span(d.span),
                 ),
             }
         }

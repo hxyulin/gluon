@@ -15,11 +15,12 @@
 //!   lands in its own subdirectory namespace.
 //!
 //! - [`build_layout_context_at`] stops just before the rustc probe
-//!   and returns only the layout + project root. Used by `clean`,
-//!   which only needs to know where `build/` lives. This is
-//!   important: `clean` is the subcommand users reach for when their
-//!   toolchain is broken, so forcing a rustc probe would make the
-//!   tool useless in exactly that situation.
+//!   and returns a [`LayoutContext`] (the evaluated model, resolved
+//!   config, build layout, and project root). Used by `clean` and
+//!   `fmt`, which do not need rustc metadata. This is important:
+//!   both are subcommands users reach for when their toolchain is
+//!   broken or partially installed, so forcing a rustc probe would
+//!   make the tools useless in exactly that situation.
 //!
 //! Both `_at` variants take the working directory explicitly so unit
 //! tests can exercise the full wiring against a tempdir without
@@ -33,6 +34,7 @@ pub mod clippy;
 pub mod configure;
 pub mod external;
 pub mod fmt;
+pub mod vendor;
 
 use anyhow::{Context, Result};
 use gluon_core::config::{
@@ -40,6 +42,7 @@ use gluon_core::config::{
     merge_overrides,
 };
 use gluon_core::model::{BuildModel, ResolvedConfig};
+use gluon_core::vendor as core_vendor;
 use gluon_core::{
     BuildLayout, Cache, CompileCtx, DriverKind, RustcInfo, evaluate, find_project_root,
     resolve_config,
@@ -165,16 +168,78 @@ pub struct LayoutContext {
 /// through [`build_context_at_for_driver`] instead because they need the rustc
 /// probe — `build` for sysroot compilation, `configure` for the
 /// analyzer's `rust_src` field.
+///
+/// Thin wrapper around [`build_layout_context_at_with_opts`] with
+/// vendor auto-registration enabled; use the `_with_opts` variant
+/// when a subcommand needs to bypass auto-registration (`gluon
+/// vendor` itself must, to avoid chicken-and-egg failures on stale
+/// lockfiles).
 pub fn build_layout_context_at(
     cwd: &Path,
     profile: Option<&str>,
     target: Option<&str>,
     config_file: Option<&Path>,
 ) -> Result<LayoutContext> {
+    build_layout_context_at_with_opts(
+        cwd,
+        profile,
+        target,
+        config_file,
+        LayoutContextOpts::default(),
+    )
+}
+
+/// Options tweaking the model load sequence.
+///
+/// Exists so `gluon vendor` can short-circuit auto-registration while
+/// every other subcommand gets the default
+/// register-vendored-deps-before-resolve behavior.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LayoutContextOpts {
+    /// Skip the [`gluon_core::vendor::auto_register_vendored_deps`]
+    /// pass. Needed by `gluon vendor --check` / sync because they
+    /// *are* the thing that fixes a stale lock — running the
+    /// auto-register with a stale lock would abort before the fix can
+    /// run.
+    pub skip_vendor_autoreg: bool,
+}
+
+/// Full-control version of [`build_layout_context_at`]. Every public
+/// wrapper ultimately funnels through this.
+pub fn build_layout_context_at_with_opts(
+    cwd: &Path,
+    profile: Option<&str>,
+    target: Option<&str>,
+    config_file: Option<&Path>,
+    opts: LayoutContextOpts,
+) -> Result<LayoutContext> {
     let project_root = find_project_root(cwd)
         .context("could not find a gluon.rhai in the current directory or any parent")?;
     let script = project_root.join("gluon.rhai");
-    let model = evaluate(&script).context("failed to evaluate gluon.rhai")?;
+    let mut model = evaluate(&script).context("failed to evaluate gluon.rhai")?;
+
+    // --- Vendor auto-registration ---
+    //
+    // Runs after the Rhai intern pass (which already happened inside
+    // `evaluate`) and before `resolve_config`. Reads `gluon.lock`,
+    // verifies its fingerprint against the live model, and inserts
+    // synthetic CrateDefs for every pinned package so the compile
+    // path sees vendored crates as ordinary model entries. `gluon
+    // vendor` skips this via `opts.skip_vendor_autoreg` because *it*
+    // is the thing that fixes a stale lock — running the check here
+    // would abort before the fix could run.
+    if !opts.skip_vendor_autoreg {
+        let layout_for_vendor = BuildLayout::new(
+            project_root.join("build"),
+            // Use a placeholder name here — `auto_register_vendored_deps`
+            // only reads the build root and project root, not the
+            // project name, so we don't have to wait for
+            // `resolve_config` to learn it.
+            "gluon-vendor-autoreg",
+        );
+        core_vendor::auto_register_vendored_deps(&mut model, &layout_for_vendor, &project_root)
+            .context("failed to auto-register vendored dependencies")?;
+    }
 
     // Pick a default profile when the user didn't pass `-p`. We use the
     // first profile by name (BTreeMap-backed, so this is deterministic

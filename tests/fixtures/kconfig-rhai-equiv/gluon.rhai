@@ -1,10 +1,13 @@
-// K9 fixture: the pure-Rhai equivalent of `kconfig-minimal/options.kconfig`
-// for the AND-of-symbols subset that both forms can express.
+// K9 fixture: the pure-Rhai equivalent of `kconfig-minimal/options.kconfig`.
 //
-// FANCY_FEATURE is intentionally omitted because its `depends_on`
-// expression in the .kconfig form (`LOG_ENABLED && !DEBUG`) cannot be
-// expressed in the legacy flat-Vec<String> Rhai builder. The K9 parity
-// test only compares the options both fixtures declare.
+// Including FANCY_FEATURE — which uses the full `&&`/`!` expression
+// grammar — is the whole point of the `.depends_on_expr(...)` Rhai
+// method: it reuses the `.kconfig` expression parser so this fixture
+// can declare the same shape the `.kconfig` file does without a second
+// grammar. The K9 parity test compares every option across both
+// fixtures; if the resolver produced different values for
+// FANCY_FEATURE between the two forms, the round-trip test would
+// notice.
 
 project("kconfig-minimal", "0.1.0");
 
@@ -26,6 +29,10 @@ config_u32("LOG_LEVEL")
 
 config_bool("DEBUG")
     .default_value(false);
+
+config_bool("FANCY_FEATURE")
+    .default_value(true)
+    .depends_on_expr("LOG_ENABLED && !DEBUG");
 
 preset("verbose")
     .set("LOG_LEVEL", 5)

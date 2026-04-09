@@ -48,6 +48,23 @@ fn run() -> Result<()> {
         )?;
         return cmd::fmt::run(ctx, args.check);
     }
+    // `vendor` skips the vendor-autoregister step in the context
+    // builder because it *is* the thing that produces / fixes the
+    // lock file — registering against a stale lock would abort
+    // before we could repair it.
+    if let cli::Command::Vendor(args) = &cli.command {
+        let cwd = std::env::current_dir()?;
+        let ctx = cmd::build_layout_context_at_with_opts(
+            &cwd,
+            cli.profile.as_deref(),
+            cli.target.as_deref(),
+            cli.config_file.as_deref(),
+            cmd::LayoutContextOpts {
+                skip_vendor_autoreg: true,
+            },
+        )?;
+        return cmd::vendor::run(ctx, args.check, args.force, args.offline);
+    }
 
     // `check` builds a context whose layout is flavored for the check
     // driver — that's what routes user-crate output under
@@ -91,6 +108,7 @@ fn run() -> Result<()> {
         | cli::Command::Clippy(_)
         | cli::Command::Clean(_)
         | cli::Command::Fmt(_)
+        | cli::Command::Vendor(_)
         | cli::Command::External(_) => {
             unreachable!("handled above")
         }

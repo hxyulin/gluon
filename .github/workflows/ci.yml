@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel any in-progress runs for the same ref — a push to a branch
+# supersedes the previous build of that branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the target dir outside the workspace so actions/cache can
+  # pick it up cleanly across jobs if we ever enable caching.
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # rust-toolchain.toml pins the channel (currently nightly) and the
+  # required components (rustfmt, clippy, rust-src). We use
+  # dtolnay/rust-toolchain with no version input so it defers to the
+  # toolchain file — editing rust-toolchain.toml is the single source
+  # of truth for the toolchain used in CI as well as locally.
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: clippy, rust-src
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+      - run: cargo test --workspace
+
+  # Network-gated vendor end-to-end test. Separate job because it
+  # actually shells out to `cargo vendor` against crates.io — a
+  # transient index fetch failure here should not redden the main
+  # test suite. The main `test` job already runs every unit test and
+  # the path-only `vendor_e2e` integration tests with the feature
+  # flag off.
+  vendor-e2e:
+    name: vendor e2e (network)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+      - run: cargo test -p gluon-core --test vendor_e2e --features gluon-core/network-tests
+
+  # Dogfood check: gluon fmt --check must succeed on our own fixture.
+  # This is the "gluon uses gluon" signal — if the fixture's crates
+  # are unformatted, or `gluon fmt` regresses and can't discover them,
+  # CI fails loudly. Runs after the main test job so fmt/clippy/test
+  # issues surface first rather than being masked by a gluon-fmt
+  # failure.
+  gluon-fmt-check:
+    name: gluon fmt --check (dogfood)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rustfmt, rust-src
+      - name: Build gluon-cli
+        run: cargo build -p gluon-cli
+      - name: Run gluon fmt --check against the minimal fixture
+        working-directory: tests/fixtures/minimal
+        run: ${{ github.workspace }}/target/debug/gluon fmt --check

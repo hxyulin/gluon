@@ -3,7 +3,7 @@
 use crate::config::interpolate::interpolate;
 use crate::error::{Diagnostic, Error, Result};
 use gluon_model::{
-    BuildModel, ConfigOptionDef, ConfigType, ConfigValue, CrateDef, Handle, ProfileDef,
+    BuildModel, ConfigOptionDef, ConfigType, ConfigValue, CrateDef, Expr, Handle, ProfileDef,
     ResolvedConfig, ResolvedCrateRef, ResolvedProfile, ResolvedValue, TargetDef, TristateVal,
 };
 use std::collections::{BTreeMap, HashSet};
@@ -181,58 +181,33 @@ pub fn resolve(
                 continue;
             };
 
-            // Two paths:
-            //
-            // 1. `depends_on_expr` is `Some` (populated by the .kconfig
-            //    loader). Evaluate the full boolean expression — `&&`,
-            //    `||`, `!`, grouping — against the current resolved
-            //    state. This is the only path where `A || B` and
-            //    `A && B` resolve differently.
-            //
-            // 2. Otherwise fall through to the legacy flat
-            //    `Vec<String>` path, which the Rhai builder still
-            //    populates. The flat form is implicitly an AND-of-
-            //    symbols and matches the historical behavior.
-            //
-            // Both paths force the option to its `off` value when
-            // unsatisfied; only the diagnostic message differs.
+            // Single path: evaluate `depends_on_expr` if present. Both
+            // declaration surfaces — the `.kconfig` loader and the Rhai
+            // `.depends_on(...)` / `.depends_on_expr(...)` builders —
+            // populate this Expr tree. For the common case of a plain
+            // AND-of-idents (which is what `.depends_on([A, B])` and a
+            // `.kconfig` `depends_on = A && B` both produce), we walk
+            // the tree to name the first unsatisfied ident in the
+            // diagnostic so the user isn't left staring at a generic
+            // "expression not satisfied" message.
             if let Some(expr) = &opt.depends_on_expr {
                 let lookup = |n: &str| resolved_options.get(n).map(is_on);
                 if !expr.eval(&lookup) {
                     let off = off_value_for(opt);
                     let cur = resolved_options.get(name);
                     if cur != Some(&off) {
-                        diags.push(
-                            Diagnostic::error(format!(
-                                "option '{name}' disabled because its 'depends_on' expression is not satisfied"
-                            ))
-                            .with_note("depends_on_expr evaluates with `&&`/`||`/`!` semantics; check that the referenced options are set to the values you expect"),
-                        );
-                        resolved_options.insert(name.clone(), off);
-                        changed = true;
-                    }
-                }
-            } else if !opt.depends_on.is_empty() {
-                let unsatisfied: Option<String> = opt
-                    .depends_on
-                    .iter()
-                    .find(|dep| {
-                        resolved_options
-                            .get(dep.as_str())
-                            .map(|v| !is_on(v))
-                            .unwrap_or(true)
-                    })
-                    .cloned();
-                if let Some(dep_name) = unsatisfied {
-                    let off = off_value_for(opt);
-                    let cur = resolved_options.get(name);
-                    if cur != Some(&off) {
-                        diags.push(
+                        let diag = if let Some(dep_name) = first_unsatisfied_ident(expr, &lookup) {
                             Diagnostic::error(format!(
                                 "option '{name}' disabled because dependency '{dep_name}' is not satisfied"
                             ))
-                            .with_note("depends_on forces an option to its 'off' value when any dependency is off"),
-                        );
+                            .with_note("depends_on forces an option to its 'off' value when any dependency is off")
+                        } else {
+                            Diagnostic::error(format!(
+                                "option '{name}' disabled because its 'depends_on' expression is not satisfied"
+                            ))
+                            .with_note("depends_on_expr evaluates with `&&`/`||`/`!` semantics; check that the referenced options are set to the values you expect")
+                        };
+                        diags.push(diag);
                         resolved_options.insert(name.clone(), off);
                         changed = true;
                     }
@@ -538,6 +513,50 @@ fn config_type_name(t: ConfigType) -> &'static str {
         ConfigType::Choice => "choice",
         ConfigType::List => "list",
         ConfigType::Group => "group",
+    }
+}
+
+/// If `expr` is (recursively) an `And` of `Ident`s that evaluates false,
+/// return the name of the first ident in left-to-right order whose
+/// referenced option is off under `lookup`. For any more complex shape
+/// (`Or`, `Not`, `Const`, or a mixed `And` containing non-ident
+/// children), return `None` — the caller falls back to a generic
+/// "expression not satisfied" diagnostic, since there is no single
+/// "responsible" dependency to name.
+///
+/// This exists purely to preserve the legacy-path diagnostic wording
+/// for the common case of `.depends_on([A, B])` — it is not load-bearing
+/// for correctness.
+fn first_unsatisfied_ident<F>(expr: &Expr, lookup: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<bool>,
+{
+    match expr {
+        Expr::Ident(name) => {
+            if lookup(name).unwrap_or(false) {
+                None
+            } else {
+                Some(name.clone())
+            }
+        }
+        Expr::And(xs) => {
+            // Every child must also be Ident-only for the simple
+            // diagnostic to apply; any `Or`/`Not`/`Const`/nested `And`
+            // rejects the whole traversal so we fall back to the
+            // generic message.
+            for child in xs {
+                match child {
+                    Expr::Ident(name) => {
+                        if !lookup(name).unwrap_or(false) {
+                            return Some(name.clone());
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -851,15 +870,50 @@ mod tests {
         // result is Err with a Diagnostics payload — not a hard
         // failure, but the resolver still flips X off in the model.
         // The test just confirms the diagnostic appears.
+        //
+        // For a plain `And(Ident, Ident)` expression the collapsed
+        // resolver walks the tree to name the first unsatisfied ident
+        // (B), matching the legacy dep-name wording. The generic
+        // "expression is not satisfied" phrasing is reserved for shapes
+        // `first_unsatisfied_ident` can't simplify (`Or`, `Not`, mixed).
+        match cfg {
+            Err(Error::Diagnostics(v)) => {
+                assert!(
+                    v.iter().any(|d| d.message.contains("dependency 'B'")),
+                    "expected diagnostic naming B as the unsatisfied dep, got: {v:?}"
+                );
+            }
+            other => panic!("expected Diagnostics about depends_on expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_config_depends_on_expr_or_unsatisfied_uses_generic_message() {
+        // For `A || B` with both A and B off, the expression doesn't
+        // reduce to a single responsible dep, so the resolver falls
+        // back to the generic "expression is not satisfied" message.
+        let cfg = resolve_kconfig_pair(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            profile("default").target("x");
+            load_kconfig("./options.kconfig");
+            "#,
+            r#"
+            config A: bool { default = false }
+            config B: bool { default = false }
+            config X: bool { default = true depends_on = A || B }
+            "#,
+        );
         match cfg {
             Err(Error::Diagnostics(v)) => {
                 assert!(
                     v.iter()
                         .any(|d| d.message.contains("'depends_on' expression")),
-                    "expected expression-disable diagnostic, got: {v:?}"
+                    "expected generic expression-not-satisfied diagnostic, got: {v:?}"
                 );
             }
-            other => panic!("expected Diagnostics about depends_on expression, got {other:?}"),
+            other => panic!("expected Diagnostics, got {other:?}"),
         }
     }
 

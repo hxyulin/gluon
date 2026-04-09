@@ -6,7 +6,8 @@ use crate::engine::EngineState;
 use crate::engine::conversions::{array_to_string_vec, parse_dep_map};
 use crate::error::Diagnostic;
 use gluon_model::{
-    CrateDef, CrateType, DepSource, ExternalDepDef, GroupDef, ProfileDef, ProjectDef, TargetDef,
+    BuildModel, CrateDef, CrateType, DepSource, ExternalDepDef, GitRef, GroupDef, ProfileDef,
+    ProjectDef, TargetDef,
 };
 use rhai::{Dynamic, Engine, Map, NativeCallContext, Position};
 
@@ -852,4 +853,107 @@ fn register_dependency(engine: &mut Engine, state: EngineState) {
             }
         }
     );
+
+    // ------------------------------------------------------------------
+    // Non-CratesIo source variants (sub-project #3).
+    //
+    // `.path(dir)`, `.git(url)`, and the three `.rev`/`.tag`/`.branch`
+    // refiners replace the default `DepSource::CratesIo { version: "" }`
+    // with the corresponding variant. They are mutually exclusive on
+    // a single dep; calling `.path` after `.git` just overwrites the
+    // source (and vice versa), matching the "last setter wins"
+    // convention the version/features methods already use.
+    // ------------------------------------------------------------------
+
+    builder_method!(
+        engine,
+        "path",
+        DependencyBuilder,
+        |state, model, name, pos, path: &str| {
+            let _ = (state, pos);
+            if let Some(h) = model.external_deps.lookup(name)
+                && let Some(d) = model.external_deps.get_mut(h)
+            {
+                d.source = DepSource::Path { path: path.into() };
+            }
+        }
+    );
+
+    builder_method!(
+        engine,
+        "git",
+        DependencyBuilder,
+        |state, model, name, pos, url: &str| {
+            let _ = (state, pos);
+            if let Some(h) = model.external_deps.lookup(name)
+                && let Some(d) = model.external_deps.get_mut(h)
+            {
+                d.source = DepSource::Git {
+                    url: url.into(),
+                    reference: GitRef::Default,
+                };
+            }
+        }
+    );
+
+    builder_method!(
+        engine,
+        "rev",
+        DependencyBuilder,
+        |state, model, name, pos, rev: &str| {
+            set_git_ref(state, &mut model, name, pos, GitRef::Rev(rev.into()));
+        }
+    );
+
+    builder_method!(
+        engine,
+        "tag",
+        DependencyBuilder,
+        |state, model, name, pos, tag: &str| {
+            set_git_ref(state, &mut model, name, pos, GitRef::Tag(tag.into()));
+        }
+    );
+
+    builder_method!(
+        engine,
+        "branch",
+        DependencyBuilder,
+        |state, model, name, pos, branch: &str| {
+            set_git_ref(state, &mut model, name, pos, GitRef::Branch(branch.into()));
+        }
+    );
+}
+
+/// Shared body for `.rev` / `.tag` / `.branch`.
+///
+/// Refines the ref of an existing [`DepSource::Git`]. If the user
+/// calls one of these *before* `.git(url)`, the dep is still in the
+/// default `CratesIo` state — we emit a diagnostic pointing at the
+/// call site so the mistake is obvious.
+fn set_git_ref(
+    state: &EngineState,
+    model: &mut BuildModel,
+    name: &str,
+    pos: Position,
+    new_ref: GitRef,
+) {
+    let Some(h) = model.external_deps.lookup(name) else {
+        return;
+    };
+    let Some(d) = model.external_deps.get_mut(h) else {
+        return;
+    };
+    match &mut d.source {
+        DepSource::Git { reference, .. } => {
+            *reference = new_ref;
+        }
+        _ => {
+            state.push_diagnostic(
+                Diagnostic::error(format!(
+                    "dependency '{name}': .rev/.tag/.branch requires a .git(...) call first"
+                ))
+                .with_span(state.span_from(pos)),
+            );
+        }
+    }
 }

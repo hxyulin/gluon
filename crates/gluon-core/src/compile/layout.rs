@@ -195,6 +195,42 @@ impl BuildLayout {
     pub fn rustc_info_cache(&self) -> PathBuf {
         self.root.join(".rustc-info.json")
     }
+
+    // -------- vendor paths (sub-project #3) --------
+
+    /// Path to the populated vendor directory (`<project>/vendor/`).
+    ///
+    /// Populated by `gluon vendor` via `cargo vendor`, then read by the
+    /// compile path through [`super::super::vendor::auto_register_vendored_deps`].
+    /// Lives at the *project* root (not the build root) so it is
+    /// visible to users and can be committed / gitignored per project
+    /// policy. Gitignored by default.
+    pub fn vendor_dir(&self, project_root: &Path) -> PathBuf {
+        project_root.join("vendor")
+    }
+
+    /// Scratch Cargo workspace used to drive `cargo vendor`
+    /// (`<root>/vendor-workspace/`).
+    ///
+    /// Contains a generated `Cargo.toml` + stub `lib.rs` synthesised
+    /// from `BuildModel::external_deps`, plus the `Cargo.lock` that
+    /// cargo writes during `cargo vendor`. The `Cargo.lock` inside this
+    /// dir is the authoritative resolution pin; it is intended to be
+    /// committed via a `.gitignore` carveout so repeat vendor runs are
+    /// deterministic across machines.
+    pub fn vendor_workspace_dir(&self) -> PathBuf {
+        self.root.join("vendor-workspace")
+    }
+
+    /// Path to the project-root `gluon.lock` file.
+    ///
+    /// `gluon.lock` is a thin TOML peer of `Cargo.lock`: it pins the
+    /// vendored set and carries a fingerprint over the declared
+    /// `external_deps` so `gluon build` can detect staleness without
+    /// re-running `cargo vendor`.
+    pub fn gluon_lock(&self, project_root: &Path) -> PathBuf {
+        project_root.join("gluon.lock")
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +346,50 @@ mod tests {
         assert_eq!(
             layout().rustc_info_cache(),
             PathBuf::from("/tmp/fake/.rustc-info.json")
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Vendor paths (sub-project #3)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn vendor_dir_is_project_relative_not_build_relative() {
+        // vendor/ lives at the project root, not under build/. This is
+        // deliberate: users see and commit (or gitignore) vendor/ at
+        // the top of the tree, and the build path reads from there.
+        let l = layout();
+        let project = Path::new("/tmp/project");
+        assert_eq!(l.vendor_dir(project), PathBuf::from("/tmp/project/vendor"));
+    }
+
+    #[test]
+    fn vendor_workspace_dir_is_under_build_root() {
+        // The scratch Cargo workspace is gluon-managed and lives under
+        // build/. Cargo.toml + Cargo.lock inside it are the source of
+        // truth for resolution (Cargo.lock committed via gitignore
+        // carveout).
+        assert_eq!(
+            layout().vendor_workspace_dir(),
+            PathBuf::from("/tmp/fake/vendor-workspace")
+        );
+    }
+
+    #[test]
+    fn vendor_workspace_dir_shared_across_drivers() {
+        // Vendoring is a build-tree-wide concern; check/clippy must
+        // reuse the same scratch workspace that `gluon build` would.
+        let rustc = layout();
+        let check = check_layout();
+        assert_eq!(rustc.vendor_workspace_dir(), check.vendor_workspace_dir());
+    }
+
+    #[test]
+    fn gluon_lock_path_is_at_project_root() {
+        let project = Path::new("/tmp/project");
+        assert_eq!(
+            layout().gluon_lock(project),
+            PathBuf::from("/tmp/project/gluon.lock")
         );
     }
 

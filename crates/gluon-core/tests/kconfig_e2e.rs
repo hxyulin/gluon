@@ -99,10 +99,69 @@ fn kconfig_loader_resolves_boolean_expression_form() {
         gluon_core::evaluate(&kconfig_dir.join("gluon.rhai")).expect("evaluate kconfig fixture");
     let resolved =
         gluon_core::resolve_config(&model, "default", None, &kconfig_dir, None).expect("resolve");
+    // Pin the intermediate values explicitly so that editing the
+    // fixture defaults flips this test loudly instead of letting the
+    // expression silently become vacuous (see the comment on
+    // FANCY_FEATURE in `extras.kconfig`).
+    assert_eq!(
+        resolved.options.get("LOG_ENABLED"),
+        Some(&ResolvedValue::Bool(true)),
+        "fixture invariant: LOG_ENABLED defaults to true"
+    );
+    assert_eq!(
+        resolved.options.get("DEBUG"),
+        Some(&ResolvedValue::Bool(false)),
+        "fixture invariant: DEBUG defaults to false"
+    );
     assert_eq!(
         resolved.options.get("FANCY_FEATURE"),
         Some(&ResolvedValue::Bool(true)),
         "FANCY_FEATURE should be enabled because LOG_ENABLED && !DEBUG holds at default"
+    );
+}
+
+#[test]
+fn rhai_depends_on_expr_honours_or_semantics() {
+    // Parity check for `.depends_on_expr(...)` on the Rhai side.
+    //
+    // Defaults: A=true, B=false. The expression `A || B` is true
+    // under the *semantic* Expr evaluation path (reuses the kconfig
+    // grammar) so DEP keeps its default of true. If the Rhai builder
+    // were still routing this through the legacy flat `Vec<String>`
+    // AND-of-names path, it would treat `A` and `B` as two separate
+    // required symbols, see `B` is off, and force DEP to false.
+    // Therefore this test's pass/fail cleanly distinguishes the two
+    // encodings — it is the smoking gun proving the Rhai surface
+    // reuses the `.kconfig` expression grammar, not a second parser.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let script = r#"
+        project("expr-parity", "0.1.0");
+        target("x86_64-unknown-none");
+        profile("default").target("x86_64-unknown-none");
+        config_bool("A").default_value(true);
+        config_bool("B").default_value(false);
+        config_bool("DEP").default_value(true).depends_on_expr("A || B");
+    "#;
+    std::fs::write(tmp.path().join("gluon.rhai"), script).unwrap();
+
+    let model = gluon_core::evaluate(&tmp.path().join("gluon.rhai")).expect("evaluate");
+    let resolved =
+        gluon_core::resolve_config(&model, "default", None, tmp.path(), None).expect("resolve");
+
+    assert_eq!(
+        resolved.options.get("A"),
+        Some(&ResolvedValue::Bool(true)),
+        "sanity check: A should default to true"
+    );
+    assert_eq!(
+        resolved.options.get("B"),
+        Some(&ResolvedValue::Bool(false)),
+        "sanity check: B should default to false"
+    );
+    assert_eq!(
+        resolved.options.get("DEP"),
+        Some(&ResolvedValue::Bool(true)),
+        "DEP should stay on because A || B holds (A is on)"
     );
 }
 

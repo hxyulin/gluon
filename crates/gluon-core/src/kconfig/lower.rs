@@ -119,7 +119,6 @@ impl Lowerer {
             ty,
             default: neutral_default(ty),
             help: None,
-            depends_on: Vec::new(),
             selects: Vec::new(),
             range: None,
             choices: None,
@@ -129,7 +128,6 @@ impl Lowerer {
                 Some(menu_stack.join("."))
             },
             bindings: Vec::new(),
-            visible_if: Vec::new(),
             span: Some(cb.span.clone()),
             depends_on_expr: None,
             visible_if_expr: None,
@@ -244,18 +242,9 @@ impl Lowerer {
                 opt.bindings.push(map_binding(*tag));
             }
             ConfigProp::DependsOn { expr, .. } => {
-                // Populate both the expression form (for the resolver
-                // to evaluate semantically) and the flat Vec<String>
-                // (for any consumer that still walks the old form).
-                let mut idents = Vec::new();
-                expr.referenced_idents(&mut idents);
-                opt.depends_on = idents.into_iter().map(|s| s.to_string()).collect();
                 opt.depends_on_expr = Some(expr.clone());
             }
             ConfigProp::VisibleIf { expr, .. } => {
-                let mut idents = Vec::new();
-                expr.referenced_idents(&mut idents);
-                opt.visible_if = idents.into_iter().map(|s| s.to_string()).collect();
                 opt.visible_if_expr = Some(expr.clone());
             }
             ConfigProp::Selects { names, .. } => {
@@ -684,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn depends_on_expr_populates_both_flat_and_expr_forms() {
+    fn depends_on_expr_is_populated_with_full_expression_tree() {
         let lw = lower_ok(
             r#"
             config A: bool {}
@@ -693,11 +682,25 @@ mod tests {
         "#,
         );
         let opt = lw.options.get("X").unwrap();
-        assert!(opt.depends_on_expr.is_some());
-        // Flat form should contain both referenced idents.
-        let mut flat = opt.depends_on.clone();
-        flat.sort();
-        assert_eq!(flat, vec!["A", "B"]);
+        let expr = opt.depends_on_expr.as_ref().expect("depends_on_expr set");
+        // Round-trip check: the referenced idents collected from the
+        // tree are exactly the names the clause mentioned.
+        let mut refs = Vec::new();
+        expr.referenced_idents(&mut refs);
+        let mut refs: Vec<String> = refs.into_iter().map(String::from).collect();
+        refs.sort();
+        assert_eq!(refs, vec!["A", "B"]);
+        // Shape check: `A && !B` must preserve the `Not` on B rather
+        // than being flattened to `A && B`.
+        match expr {
+            gluon_model::Expr::And(xs) => {
+                assert!(matches!(
+                    xs.as_slice(),
+                    [gluon_model::Expr::Ident(_), gluon_model::Expr::Not(_)]
+                ));
+            }
+            other => panic!("expected And, got {other:?}"),
+        }
     }
 
     #[test]

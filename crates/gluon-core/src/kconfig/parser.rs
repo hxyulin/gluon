@@ -47,6 +47,30 @@ pub fn parse(tokens: &[Token]) -> Result<File, Vec<Diagnostic>> {
     }
 }
 
+/// Parse a standalone boolean expression (the same grammar accepted by
+/// `depends_on`/`visible_if` property values) from a pre-lexed token
+/// stream. Used by [`crate::kconfig::parse_bool_expr`] so the Rhai
+/// builder can reuse the kconfig expression grammar without duplicating
+/// it.
+///
+/// The token slice must be terminated with [`TokenKind::Eof`] (the lexer
+/// always emits one). Trailing tokens beyond a single expression are a
+/// parse error.
+pub(crate) fn parse_standalone_expr(tokens: &[Token]) -> Result<Expr, Vec<Diagnostic>> {
+    let mut p = Parser::new(tokens);
+    let Some((expr, _)) = p.parse_expr() else {
+        return Err(p.diagnostics);
+    };
+    if !p.at_eof() {
+        p.error_here("unexpected trailing tokens after expression");
+    }
+    if p.diagnostics.is_empty() {
+        Ok(expr)
+    } else {
+        Err(p.diagnostics)
+    }
+}
+
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
