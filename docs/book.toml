@@ -1,0 +1,9 @@
+[book]
+title = "Gluon"
+description = "A build system for bare-metal Rust kernels"
+authors = ["hxyulin"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
