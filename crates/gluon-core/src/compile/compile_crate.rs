@@ -300,17 +300,10 @@ pub(crate) fn build_rustc_command(
             )
             .extern_crate("alloc", &sysroot_lib.join("liballoc-gluon-alloc.rlib"));
 
-        // Inject the generated config crate if it is available AND this
-        // crate targets the same triple as the profile. The config crate
-        // is compiled once for the profile's cross target; injecting it
-        // into crates compiled for a different target would produce a
-        // target-mismatch error from rustc. Crates on other targets
-        // simply don't see the config constants — for the bootloader-
-        // with-embedded-kernel scenario, only the bootloader (on the
-        // profile target) uses config; the kernel is standalone.
-        if crate_ref.target == resolved.profile.target
-            && let Some(config_path) = artifacts.config_crate()
-        {
+        // Inject the generated config crate for this crate's target.
+        // Each cross target has its own config crate rlib so there is
+        // no target-mismatch risk.
+        if let Some(config_path) = artifacts.config_crate(crate_ref.target) {
             // The config crate name is `<project>_config` by default, or the
             // override in `ProjectDef::config_crate_name`. We sanitise the
             // project name (lowercase, non-[a-z0-9_] replaced by `_`) and
@@ -1520,7 +1513,7 @@ mod tests {
         let crate_ref = cross_ref(ch, th);
 
         let mut artifacts = ArtifactMap::new();
-        artifacts.set_config_crate(config_rlib.clone());
+        artifacts.set_config_crate(th, config_rlib.clone());
 
         let (builder, _, _) = build_rustc_command(
             &ctx,

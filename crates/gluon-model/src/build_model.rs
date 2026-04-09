@@ -27,12 +27,13 @@ pub struct BuildModel {
     /// because every reference to them is by string identifier.
     pub config_options: BTreeMap<String, ConfigOptionDef>,
     pub presets: BTreeMap<String, PresetDef>,
-    /// Stub bootloader configuration; details land in a later sub-project.
+    /// Bootloader configuration (singleton per project).
     #[serde(default)]
     pub bootloader: BootloaderDef,
-    /// Stub image configuration; details land in a later sub-project.
+    /// Disk image definitions. Zero or more named images describing how
+    /// to assemble bootable disk images from build artifacts.
     #[serde(default)]
-    pub image: ImageDef,
+    pub images: Arena<ImageDef>,
     /// Stub QEMU configuration; details land in a later sub-project.
     #[serde(default)]
     pub qemu: QemuDef,
@@ -322,19 +323,83 @@ pub struct PipelineStep {
     pub rule: Option<String>,
 }
 
-/// Stub bootloader configuration. Will be expanded in a later sub-project.
+/// Bootloader configuration. Describes the boot protocol and links the
+/// bootloader entry crate so tools can reason about boot-time dependencies.
+///
+/// The `extras` map provides a forward-compatible escape hatch for
+/// protocol-specific metadata that does not yet have a typed field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BootloaderDef {
+    /// Boot protocol identifier: `"uefi"`, `"multiboot"`, `"multiboot2"`,
+    /// `"custom"`, etc.
     pub kind: String,
-    #[serde(default)]
+    /// Optional protocol sub-variant or version (e.g. `"gop"` for UEFI
+    /// with GOP-only graphics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Name of the crate that serves as the bootloader entry point.
+    /// Resolved against the crate arena by the intern pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_crate: Option<String>,
+    /// Resolved handle for `entry_crate`, populated by the intern pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_crate_handle: Option<Handle<CrateDef>>,
+    /// Forward-compatible escape hatch for protocol-specific metadata.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extras: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<SourceSpan>,
 }
 
-/// Stub image configuration. Will be expanded in a later sub-project.
+/// Disk image configuration. Describes how to assemble a bootable image
+/// from build artifacts. The actual image creation is a future scheduler
+/// node; this type defines the model so the Rhai surface and data types
+/// are ready before consumption code lands.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageDef {
-    #[serde(default)]
+    pub name: String,
+    /// Image format: `"fat12"`, `"fat16"`, `"fat32"`, `"raw"`, `"iso9660"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Optional image size in MiB. When `None`, the builder determines
+    /// the minimum size from the entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_mb: Option<u32>,
+    /// Ordered list of entries to place into the image.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<ImageEntry>,
+    /// Forward-compatible escape hatch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extras: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<SourceSpan>,
+}
+
+/// A single entry in an [`ImageDef`]: something to copy into the image.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageEntry {
+    /// Where the data comes from.
+    pub source: ImageSource,
+    /// Destination path within the image filesystem.
+    pub dest_path: String,
+}
+
+/// Source of data for an [`ImageEntry`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSource {
+    /// A compiled crate's primary build output.
+    Crate(String),
+    /// A file on the host filesystem (relative to project root).
+    File(String),
+    /// An assembled ESP directory (by name).
+    Esp(String),
+}
+
+impl Named for ImageDef {
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// QEMU configuration for `gluon run` (and future `gluon test`).
@@ -608,6 +673,61 @@ mod tests {
         assert_eq!(de.targets.len(), 1);
         let h = de.targets.lookup("x86_64").expect("name index rebuilt");
         assert_eq!(de.targets.get(h).unwrap().spec, "x86_64-unknown-none");
+    }
+
+    #[test]
+    fn bootloader_def_round_trips_through_json() {
+        let bl = BootloaderDef {
+            kind: "uefi".into(),
+            protocol: Some("gop".into()),
+            entry_crate: Some("bootloader".into()),
+            entry_crate_handle: None,
+            extras: {
+                let mut m = BTreeMap::new();
+                m.insert("config_file".into(), "boot.cfg".into());
+                m
+            },
+            span: None,
+        };
+        let json = serde_json::to_string(&bl).unwrap();
+        let de: BootloaderDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.kind, "uefi");
+        assert_eq!(de.protocol.as_deref(), Some("gop"));
+        assert_eq!(de.entry_crate.as_deref(), Some("bootloader"));
+        assert_eq!(de.extras.get("config_file").map(String::as_str), Some("boot.cfg"));
+    }
+
+    #[test]
+    fn image_def_round_trips_through_json() {
+        let mut m = BuildModel::default();
+        let (_, inserted) = m.images.insert(
+            "disk".into(),
+            ImageDef {
+                name: "disk".into(),
+                format: Some("fat32".into()),
+                size_mb: Some(64),
+                entries: vec![ImageEntry {
+                    source: ImageSource::Crate("bootloader".into()),
+                    dest_path: "EFI/BOOT/BOOTX64.EFI".into(),
+                }],
+                extras: BTreeMap::new(),
+                span: None,
+            },
+        );
+        assert!(inserted);
+
+        let json = serde_json::to_string(&m).unwrap();
+        let de: BuildModel = serde_json::from_str(&json).unwrap();
+        let h = de.images.lookup("disk").expect("image name index rebuilt");
+        let img = de.images.get(h).unwrap();
+        assert_eq!(img.format.as_deref(), Some("fat32"));
+        assert_eq!(img.size_mb, Some(64));
+        assert_eq!(img.entries.len(), 1);
+        assert_eq!(img.entries[0].dest_path, "EFI/BOOT/BOOTX64.EFI");
+        match &img.entries[0].source {
+            ImageSource::Crate(name) => assert_eq!(name, "bootloader"),
+            other => panic!("expected ImageSource::Crate, got {other:?}"),
+        }
     }
 
     #[test]

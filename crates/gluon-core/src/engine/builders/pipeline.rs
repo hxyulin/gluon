@@ -5,8 +5,8 @@ use crate::engine::EngineState;
 use crate::engine::conversions::array_to_string_vec;
 use crate::error::Diagnostic;
 use gluon_model::{
-    BootMode, EspDef, EspEntry, EspSource, PipelineDef, PipelineStep, RuleDef, RuleHandler,
-    SerialMode,
+    BootMode, EspDef, EspEntry, EspSource, ImageDef, ImageEntry, ImageSource, PipelineDef,
+    PipelineStep, RuleDef, RuleHandler, SerialMode,
 };
 use rhai::{Dynamic, Engine, NativeCallContext, Position};
 use std::path::PathBuf;
@@ -59,6 +59,16 @@ pub struct BootloaderBuilder {
     is_duplicate: bool,
 }
 
+/// Chainable builder returned by `image("name")`. Constructs an
+/// [`ImageDef`](gluon_model::ImageDef) in the model arena.
+#[derive(Clone)]
+pub struct ImageBuilder {
+    state: EngineState,
+    name: String,
+    pos: Position,
+    is_duplicate: bool,
+}
+
 /// Chainable builder returned by `esp("name")`. Appends
 /// `(source_crate, dest_path)` entries into [`gluon_model::EspDef::entries`]
 /// via `.add(...)` calls. Duplicate declarations (two `esp("name")` calls
@@ -81,6 +91,7 @@ pub(super) fn register(engine: &mut Engine, state: &EngineState) {
     register_qemu(engine, state.clone());
     register_bootloader(engine, state.clone());
     register_esp(engine, state.clone());
+    register_image(engine, state.clone());
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +628,8 @@ fn register_bootloader(engine: &mut Engine, state: EngineState) {
                 let mut model = s.model.borrow_mut();
                 model.bootloader = gluon_model::BootloaderDef {
                     kind: kind.into(),
-                    extras: std::collections::BTreeMap::new(),
+                    span: Some(span.clone()),
+                    ..Default::default()
                 };
             }
             BootloaderBuilder {
@@ -632,6 +644,30 @@ fn register_bootloader(engine: &mut Engine, state: EngineState) {
         let mut model = builder.state.model.borrow_mut();
         model.bootloader.extras.insert(key.into(), val);
     }
+
+    engine.register_fn(
+        "entry_crate",
+        |builder: &mut BootloaderBuilder, name: &str| -> BootloaderBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            let mut model = builder.state.model.borrow_mut();
+            model.bootloader.entry_crate = Some(name.into());
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "protocol",
+        |builder: &mut BootloaderBuilder, proto: &str| -> BootloaderBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            let mut model = builder.state.model.borrow_mut();
+            model.bootloader.protocol = Some(proto.into());
+            builder.clone()
+        },
+    );
 
     engine.register_fn(
         "config_file",
@@ -775,4 +811,148 @@ fn start_esp(s: &EngineState, pos: Position, name: &str) -> EspBuilder {
         pos,
         is_duplicate,
     }
+}
+
+// ---------------------------------------------------------------------------
+// image("name") — builder that describes a disk image to assemble from
+// build artifacts. Supports multiple named images per project.
+// ---------------------------------------------------------------------------
+
+fn register_image(engine: &mut Engine, state: EngineState) {
+    let s = state;
+    engine.register_fn(
+        "image",
+        move |ctx: NativeCallContext, name: &str| -> ImageBuilder {
+            let pos = ctx.call_position();
+            let span = s.span_from(pos);
+            if name.is_empty() {
+                s.push_diagnostic(
+                    Diagnostic::error("image() name must not be empty".to_string())
+                        .with_span(span.clone()),
+                );
+            }
+            let mut model = s.model.borrow_mut();
+            let (_h, inserted) = model.images.insert(
+                name.into(),
+                ImageDef {
+                    name: name.into(),
+                    span: Some(span.clone()),
+                    ..Default::default()
+                },
+            );
+            let is_duplicate = !inserted;
+            drop(model);
+            if is_duplicate {
+                s.push_diagnostic(
+                    Diagnostic::error(format!("image(\"{name}\") is defined more than once"))
+                        .with_span(span),
+                );
+            }
+            ImageBuilder {
+                state: s.clone(),
+                name: name.into(),
+                pos,
+                is_duplicate,
+            }
+        },
+    );
+
+    engine.register_fn(
+        "format",
+        |builder: &mut ImageBuilder, fmt: &str| -> ImageBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            let mut model = builder.state.model.borrow_mut();
+            if let Some(h) = model.images.lookup(&builder.name) {
+                if let Some(img) = model.images.get_mut(h) {
+                    img.format = Some(fmt.into());
+                }
+            }
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "size",
+        |builder: &mut ImageBuilder, mb: i64| -> ImageBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            if mb <= 0 {
+                builder.state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "image(\"{}\").size: must be positive, got {mb}",
+                        builder.name
+                    ))
+                    .with_span(builder.state.span_from(builder.pos)),
+                );
+                return builder.clone();
+            }
+            let mut model = builder.state.model.borrow_mut();
+            if let Some(h) = model.images.lookup(&builder.name) {
+                if let Some(img) = model.images.get_mut(h) {
+                    img.size_mb = Some(mb as u32);
+                }
+            }
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "add_crate",
+        |builder: &mut ImageBuilder, crate_name: &str, dest: &str| -> ImageBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            let mut model = builder.state.model.borrow_mut();
+            if let Some(h) = model.images.lookup(&builder.name) {
+                if let Some(img) = model.images.get_mut(h) {
+                    img.entries.push(ImageEntry {
+                        source: ImageSource::Crate(crate_name.into()),
+                        dest_path: dest.into(),
+                    });
+                }
+            }
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "add_file",
+        |builder: &mut ImageBuilder, path: &str, dest: &str| -> ImageBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            let mut model = builder.state.model.borrow_mut();
+            if let Some(h) = model.images.lookup(&builder.name) {
+                if let Some(img) = model.images.get_mut(h) {
+                    img.entries.push(ImageEntry {
+                        source: ImageSource::File(path.into()),
+                        dest_path: dest.into(),
+                    });
+                }
+            }
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "add_esp",
+        |builder: &mut ImageBuilder, esp_name: &str, dest: &str| -> ImageBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            let mut model = builder.state.model.borrow_mut();
+            if let Some(h) = model.images.lookup(&builder.name) {
+                if let Some(img) = model.images.get_mut(h) {
+                    img.entries.push(ImageEntry {
+                        source: ImageSource::Esp(esp_name.into()),
+                        dest_path: dest.into(),
+                    });
+                }
+            }
+            builder.clone()
+        },
+    );
 }

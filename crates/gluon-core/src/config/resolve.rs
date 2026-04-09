@@ -6,7 +6,7 @@ use gluon_model::{
     BuildModel, ConfigOptionDef, ConfigType, ConfigValue, CrateDef, Expr, Handle, ProfileDef,
     ResolvedConfig, ResolvedCrateRef, ResolvedProfile, ResolvedValue, TargetDef, TristateVal,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
 
 /// Maximum number of select/depends iteration passes before declaring
@@ -295,19 +295,27 @@ pub fn resolve(
         resolved_options.insert(k, v);
     }
 
-    // 10. Resolve crate list. Include EVERY crate in the model, not just
-    //     those matching the profile's target. Multi-target projects (e.g.
-    //     a `x86_64-unknown-uefi` bootloader embedding a
-    //     `x86_64-unknown-none` kernel) need all declared crates compiled
-    //     — the DAG's `artifact_deps` edges enforce the correct ordering
-    //     across targets, and each crate gets its own sysroot node for
-    //     its specific target.
+    // 10. Resolve crate list. When boot_binary is set, include only crates
+    //     reachable from the boot binary via deps + artifact_deps closure.
+    //     This prevents wasteful compilation: a project with profile("x86")
+    //     and profile("arm") will only compile crates relevant to the
+    //     active profile's boot binary.
+    //
+    //     When boot_binary is None, fall back to including every crate
+    //     (backward compat for simple single-target projects).
     //
     //     Host crates (target == "host") set `host: true` so the
     //     scheduler compiles them for the build machine. All other crates
     //     are cross and receive their group's resolved target handle.
+    let reachable = boot_binary.map(|root| reachable_crates(model, root));
     let mut resolved_crates: Vec<ResolvedCrateRef> = Vec::new();
     for (crate_handle, krate) in model.crates.iter() {
+        // Filter to reachable crates when boot_binary is set.
+        if let Some(ref set) = reachable {
+            if !set.contains(&crate_handle) {
+                continue;
+            }
+        }
         let Some(group_h) = krate.group_handle else {
             continue;
         };
@@ -440,6 +448,65 @@ fn flatten_profile(
         }
     }
     Ok(acc)
+}
+
+/// Compute the transitive closure of crates reachable from `root` via
+/// `deps` and `artifact_deps` edges. Used when a profile declares a
+/// `boot_binary` to restrict the build to only the crates that are actually
+/// needed — preventing wasteful cross-target compilation in multi-profile
+/// projects.
+///
+/// Also expands ESP entries: if any source crate in an `EspDef` is reachable,
+/// all source crates in that ESP are included (an ESP is an atomic unit that
+/// must be assembled whole).
+fn reachable_crates(model: &BuildModel, root: Handle<CrateDef>) -> BTreeSet<Handle<CrateDef>> {
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    visited.insert(root);
+    queue.push_back(root);
+
+    while let Some(h) = queue.pop_front() {
+        let Some(krate) = model.crates.get(h) else {
+            continue;
+        };
+        // Follow regular deps (--extern edges).
+        for dep in krate.deps.values() {
+            if let Some(dh) = dep.crate_handle {
+                if visited.insert(dh) {
+                    queue.push_back(dh);
+                }
+            }
+        }
+        // Follow artifact_deps (ordering-only edges, e.g. bootloader → kernel).
+        for dep_name in &krate.artifact_deps {
+            if let Some(dh) = model.crates.lookup(dep_name) {
+                if visited.insert(dh) {
+                    queue.push_back(dh);
+                }
+            }
+        }
+    }
+
+    // ESP expansion: if any entry's source crate is reachable, pull in all
+    // entries of that ESP. An ESP is assembled as a unit — partial inclusion
+    // would produce a broken boot partition.
+    for (_h, esp) in model.esps.iter() {
+        let any_reachable = esp
+            .entries
+            .iter()
+            .any(|e| e.source_crate_handle.is_some_and(|sh| visited.contains(&sh)));
+        if any_reachable {
+            for entry in &esp.entries {
+                if let Some(sh) = entry.source_crate_handle {
+                    // No need to BFS from these — ESP source crates are leaves
+                    // in the dependency sense (they produce artifacts, not deps).
+                    visited.insert(sh);
+                }
+            }
+        }
+    }
+
+    visited
 }
 
 /// Coerce a [`ConfigValue`] into the [`ResolvedValue`] type required by an
@@ -1059,5 +1126,218 @@ mod tests {
             .find(|c| model.crates.get(c.handle).unwrap().name == "hbar")
             .unwrap();
         assert!(host_entry.host, "host crate flagged correctly");
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-profile crate filtering (reachable_crates)
+    // -----------------------------------------------------------------------
+
+    /// Helper: resolve a named profile and return the set of crate names.
+    fn crate_names_for_profile(
+        model: &BuildModel,
+        profile: &str,
+    ) -> Vec<String> {
+        let cfg = resolve(model, profile, None, Path::new("/tmp/proj"), None)
+            .expect("resolve");
+        cfg.crates
+            .iter()
+            .map(|c| model.crates.get(c.handle).unwrap().name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn filter_no_boot_binary_includes_all() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            target("y","y.json");
+            profile("default").target("x");
+            let g1 = group("a").target("x");
+            g1.add("crate_a", "crates/a");
+            let g2 = group("b").target("y");
+            g2.add("crate_b", "crates/b");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("evaluate");
+        let names = crate_names_for_profile(&model, "default");
+        assert!(names.contains(&"crate_a".into()), "got {names:?}");
+        assert!(
+            names.contains(&"crate_b".into()),
+            "no boot_binary → all crates included, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn filter_boot_binary_restricts_to_reachable() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            target("y","y.json");
+            profile("default").target("x").boot_binary("crate_a");
+            let g1 = group("a").target("x");
+            g1.add("crate_a", "crates/a").crate_type("bin");
+            let g2 = group("b").target("y");
+            g2.add("crate_b", "crates/b").crate_type("bin");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("evaluate");
+        let names = crate_names_for_profile(&model, "default");
+        assert!(names.contains(&"crate_a".into()), "boot_binary is reachable");
+        assert!(
+            !names.contains(&"crate_b".into()),
+            "crate_b is unreachable from crate_a, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn filter_artifact_deps_cross_target_included() {
+        // Bootloader on target Y depends on kernel on target X via artifact_env.
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            target("y","y.json");
+            profile("default").target("y").boot_binary("bootloader");
+            let g1 = group("kernel").target("x");
+            g1.add("kernel", "crates/kernel").crate_type("bin");
+            let g2 = group("boot").target("y");
+            g2.add("bootloader", "crates/boot")
+                .crate_type("bin")
+                .artifact_env("KERNEL_PATH", "kernel");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("evaluate");
+        let names = crate_names_for_profile(&model, "default");
+        assert!(
+            names.contains(&"bootloader".into()),
+            "boot_binary itself, got {names:?}"
+        );
+        assert!(
+            names.contains(&"kernel".into()),
+            "kernel reachable via artifact_deps, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn filter_deps_host_crate_included() {
+        // Cross crate depends on a host proc-macro — both should be included.
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            profile("default").target("x").boot_binary("kernel");
+            let h = group("host_tools").target("host");
+            h.add("my_derive", "crates/derive").crate_type("proc-macro");
+            let k = group("kernel").target("x");
+            k.add("kernel", "crates/kernel")
+                .crate_type("bin")
+                .deps(#{ my_derive: #{ crate: "my_derive" } });
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("evaluate");
+        let names = crate_names_for_profile(&model, "default");
+        assert!(names.contains(&"kernel".into()), "got {names:?}");
+        assert!(
+            names.contains(&"my_derive".into()),
+            "host crate reachable via deps, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn filter_two_profiles_disjoint_sets() {
+        // Two profiles with different boot_binary should produce disjoint crate sets.
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            target("y","y.json");
+            profile("prof_x").target("x").boot_binary("crate_x");
+            profile("prof_y").target("y").boot_binary("crate_y");
+            let g1 = group("gx").target("x");
+            g1.add("crate_x", "crates/x").crate_type("bin");
+            let g2 = group("gy").target("y");
+            g2.add("crate_y", "crates/y").crate_type("bin");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("evaluate");
+        let names_x = crate_names_for_profile(&model, "prof_x");
+        let names_y = crate_names_for_profile(&model, "prof_y");
+        assert_eq!(names_x, vec!["crate_x"], "prof_x only builds crate_x");
+        assert_eq!(names_y, vec!["crate_y"], "prof_y only builds crate_y");
+    }
+
+    #[test]
+    fn filter_esp_expansion() {
+        // ESP source crate is pulled in even if not directly reachable,
+        // as long as another entry in the same ESP is reachable.
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            target("y","y.json");
+            profile("default").target("y").boot_binary("bootloader");
+            let g1 = group("kernel").target("x");
+            g1.add("kernel", "crates/kernel").crate_type("bin");
+            let g2 = group("boot").target("y");
+            g2.add("bootloader", "crates/boot")
+                .crate_type("bin")
+                .artifact_env("KERNEL_PATH", "kernel");
+            esp("default")
+                .add("bootloader", "EFI/BOOT/BOOTX64.EFI");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("evaluate");
+        let names = crate_names_for_profile(&model, "default");
+        assert!(
+            names.contains(&"bootloader".into()),
+            "ESP source crate included, got {names:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rhai builder tests for BootloaderDef and ImageDef
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bootloader_builder_populates_typed_fields() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            profile("default").target("x");
+            bootloader("uefi")
+                .entry_crate("boot")
+                .protocol("gop");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("evaluate");
+        assert_eq!(model.bootloader.kind, "uefi");
+        assert_eq!(model.bootloader.entry_crate.as_deref(), Some("boot"));
+        assert_eq!(model.bootloader.protocol.as_deref(), Some("gop"));
+    }
+
+    #[test]
+    fn image_builder_populates_model() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            profile("default").target("x");
+            image("disk")
+                .format("fat32")
+                .size(64)
+                .add_crate("bootloader", "EFI/BOOT/BOOTX64.EFI")
+                .add_file("splash.bmp", "boot/splash.bmp")
+                .add_esp("default", "/");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("evaluate");
+        let h = model.images.lookup("disk").expect("image must exist");
+        let img = model.images.get(h).unwrap();
+        assert_eq!(img.format.as_deref(), Some("fat32"));
+        assert_eq!(img.size_mb, Some(64));
+        assert_eq!(img.entries.len(), 3);
     }
 }

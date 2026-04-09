@@ -12,7 +12,7 @@
 //! cache key, are identical across runs on any machine. This is mandatory
 //! per CLAUDE.md's determinism requirement.
 
-use gluon_model::{CrateDef, Handle};
+use gluon_model::{CrateDef, Handle, TargetDef};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -21,15 +21,15 @@ use std::path::{Path, PathBuf};
 /// Populated by the scheduler as each crate completes and consumed by
 /// `compile_crate` to wire `--extern` for that crate's dependencies.
 ///
-/// The `config_crate` slot is kept separate from the handle map because
-/// the generated `<project>_config` crate has no [`Handle<CrateDef>`] in
-/// the main arena — it is synthesised by chunk B4. Keeping it here lets
-/// `compile_crate` add the implicit `--extern <name>_config=<path>` for
-/// cross Lib/Bin crates without special-casing the scheduler.
+/// The `config_crates` map is kept separate from the handle map because
+/// the generated `<project>_config` crates have no [`Handle<CrateDef>`] in
+/// the main arena — they are synthesised by the scheduler. One config crate
+/// is compiled per distinct cross target, so `compile_crate` can add the
+/// implicit `--extern <name>_config=<path>` for cross crates on any target.
 #[derive(Debug, Default, Clone)]
 pub struct ArtifactMap {
     crates: BTreeMap<Handle<CrateDef>, PathBuf>,
-    config_crate: Option<PathBuf>,
+    config_crates: BTreeMap<Handle<TargetDef>, PathBuf>,
 }
 
 impl ArtifactMap {
@@ -72,18 +72,19 @@ impl ArtifactMap {
         self.crates.is_empty()
     }
 
-    /// Record the path of the generated config crate rlib.
+    /// Record the path of the generated config crate rlib for a specific
+    /// cross target.
     ///
-    /// Called by chunk B4 after the config crate is compiled. Once set,
-    /// `compile_crate` will inject `--extern <name>_config=<path>` for
-    /// every cross Lib/Bin crate that requests the config crate.
-    pub fn set_config_crate(&mut self, path: PathBuf) {
-        self.config_crate = Some(path);
+    /// Called by the scheduler after each per-target config crate is compiled.
+    /// `compile_crate` looks up the config crate by the crate's own target
+    /// to inject `--extern <name>_config=<path>`.
+    pub fn set_config_crate(&mut self, target: Handle<TargetDef>, path: PathBuf) {
+        self.config_crates.insert(target, path);
     }
 
-    /// The path of the config crate rlib, if it has been compiled.
-    pub fn config_crate(&self) -> Option<&Path> {
-        self.config_crate.as_deref()
+    /// The path of the config crate rlib for `target`, if it has been compiled.
+    pub fn config_crate(&self, target: Handle<TargetDef>) -> Option<&Path> {
+        self.config_crates.get(&target).map(PathBuf::as_path)
     }
 }
 
@@ -139,20 +140,31 @@ mod tests {
 
     #[test]
     fn set_config_crate_and_read_back() {
+        use gluon_model::Handle;
         let mut map = ArtifactMap::new();
-        assert_eq!(map.config_crate(), None);
+        let t0: Handle<TargetDef> = Handle::new(0);
+        let t1: Handle<TargetDef> = Handle::new(1);
+        assert_eq!(map.config_crate(t0), None);
 
-        map.set_config_crate(PathBuf::from("/build/libmyproject_config.rlib"));
+        map.set_config_crate(t0, PathBuf::from("/build/libmyproject_config.rlib"));
         assert_eq!(
-            map.config_crate(),
+            map.config_crate(t0),
             Some(Path::new("/build/libmyproject_config.rlib"))
         );
+        assert_eq!(map.config_crate(t1), None, "other target has no config crate");
 
         // Overwrite is supported (e.g. a rebuild of the config crate).
-        map.set_config_crate(PathBuf::from("/build/libmyproject_config_v2.rlib"));
+        map.set_config_crate(t0, PathBuf::from("/build/libmyproject_config_v2.rlib"));
         assert_eq!(
-            map.config_crate(),
+            map.config_crate(t0),
             Some(Path::new("/build/libmyproject_config_v2.rlib"))
+        );
+
+        // Second target gets its own config crate.
+        map.set_config_crate(t1, PathBuf::from("/build/libmyproject_config_t1.rlib"));
+        assert_eq!(
+            map.config_crate(t1),
+            Some(Path::new("/build/libmyproject_config_t1.rlib"))
         );
     }
 

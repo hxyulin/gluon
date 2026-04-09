@@ -46,8 +46,11 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum DagNode {
     /// Build the custom sysroot for a specific target triple.
     Sysroot(Handle<TargetDef>),
-    /// Generate + compile the `<project>_config` crate. Singleton per build.
-    ConfigCrate,
+    /// Generate + compile the `<project>_config` crate for a specific target.
+    /// One per distinct cross target in `resolved.crates` — each target gets
+    /// its own config crate rlib so all cross crates can `--extern` it
+    /// regardless of which target they compile for.
+    ConfigCrate(Handle<TargetDef>),
     /// Compile a user-declared crate (host or cross).
     Crate(Handle<CrateDef>),
     /// Run a user-declared rule via the rule registry.
@@ -243,7 +246,7 @@ pub fn build_dag(resolved: &ResolvedConfig, model: &BuildModel) -> Result<Dag> {
     //
     // The profile's target always gets a sysroot node (for the config crate);
     // additional targets appear if any resolved crate references them.
-    let profile_sysroot_id = dag.insert_node(DagNode::Sysroot(resolved.profile.target));
+    dag.insert_node(DagNode::Sysroot(resolved.profile.target));
     for crate_ref in &resolved.crates {
         if !crate_ref.host {
             dag.insert_node(DagNode::Sysroot(crate_ref.target));
@@ -251,12 +254,24 @@ pub fn build_dag(resolved: &ResolvedConfig, model: &BuildModel) -> Result<Dag> {
     }
 
     // -----------------------------------------------------------------------
-    // Step 2: Insert the ConfigCrate node and wire it to the profile sysroot.
-    // Edge rule 3: ConfigCrate depends on the profile target's sysroot
-    // (it's compiled for that target).
+    // Step 2: Insert one ConfigCrate node per distinct cross target.
+    // Each ConfigCrate depends on its own target's sysroot.
     // -----------------------------------------------------------------------
-    let config_id = dag.insert_node(DagNode::ConfigCrate);
-    dag.add_edge(profile_sysroot_id, config_id);
+    // Collect distinct cross targets. The profile target always gets one
+    // (even if no crate uses it — the config crate is unconditional);
+    // additional targets appear from resolved.crates.
+    let mut config_targets: BTreeSet<Handle<TargetDef>> = BTreeSet::new();
+    config_targets.insert(resolved.profile.target);
+    for crate_ref in &resolved.crates {
+        if !crate_ref.host {
+            config_targets.insert(crate_ref.target);
+        }
+    }
+    for &target in &config_targets {
+        let sysroot_id = dag.insert_node(DagNode::Sysroot(target));
+        let config_id = dag.insert_node(DagNode::ConfigCrate(target));
+        dag.add_edge(sysroot_id, config_id);
+    }
 
     // -----------------------------------------------------------------------
     // Step 3: Insert every crate in resolved.crates.
@@ -278,14 +293,11 @@ pub fn build_dag(resolved: &ResolvedConfig, model: &BuildModel) -> Result<Dag> {
             // independent sysroots per target).
             let crate_sysroot_id = dag.insert_node(DagNode::Sysroot(crate_ref.target));
             dag.add_edge(crate_sysroot_id, crate_id);
-            // Rule 2: cross crate → config crate ONLY when the crate
-            // targets the same triple as the profile. The config crate
-            // is compiled once for the profile's cross target; injecting
-            // it into crates on a different target would cause a target
-            // mismatch error from rustc.
-            if crate_ref.target == resolved.profile.target {
-                dag.add_edge(config_id, crate_id);
-            }
+            // Rule 2: cross crate → config crate for its own target.
+            // Each target has its own ConfigCrate node so there is no
+            // target-mismatch risk.
+            let config_id = dag.insert_node(DagNode::ConfigCrate(crate_ref.target));
+            dag.add_edge(config_id, crate_id);
         }
 
         // Edge rule 4: crate → its dependency crates.
@@ -560,7 +572,7 @@ mod tests {
         let th = make_target(&mut model, "x86_64-test");
 
         let a = dag.insert_node(DagNode::Sysroot(th));
-        let b = dag.insert_node(DagNode::ConfigCrate);
+        let b = dag.insert_node(DagNode::ConfigCrate(th));
 
         // First insertion: in-degree of b becomes 1.
         dag.add_edge(a, b);
@@ -621,7 +633,7 @@ mod tests {
         let th = make_target(&mut model, "x86_64-test");
 
         let sysroot = dag.insert_node(DagNode::Sysroot(th));
-        let config = dag.insert_node(DagNode::ConfigCrate);
+        let config = dag.insert_node(DagNode::ConfigCrate(th));
         dag.add_edge(sysroot, config);
 
         let ready = dag.ready();
@@ -663,7 +675,7 @@ mod tests {
             .expect("Sysroot node");
         let config_id = *dag
             .node_index
-            .get(&DagNode::ConfigCrate)
+            .get(&DagNode::ConfigCrate(th))
             .expect("ConfigCrate node");
         let crate_id = *dag.node_index.get(&DagNode::Crate(ch)).expect("Crate node");
 
@@ -753,7 +765,7 @@ mod tests {
         let dag = build_dag(&resolved, &model).unwrap();
 
         let sysroot_id = *dag.node_index.get(&DagNode::Sysroot(th)).unwrap();
-        let config_id = *dag.node_index.get(&DagNode::ConfigCrate).unwrap();
+        let config_id = *dag.node_index.get(&DagNode::ConfigCrate(th)).unwrap();
         let host_id = *dag.node_index.get(&DagNode::Crate(host_h)).unwrap();
         let cross_id = *dag.node_index.get(&DagNode::Crate(cross_h)).unwrap();
 
@@ -1300,5 +1312,65 @@ mod tests {
         // Consumer's in-degree: Sysroot + ConfigCrate only (no artifact edge).
         let consumer_id = *dag.node_index.get(&DagNode::Crate(consumer_h)).unwrap();
         assert_eq!(*dag.in_degree.get(&consumer_id).unwrap(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: two cross targets produce two ConfigCrate nodes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn build_dag_two_targets_two_config_crates() {
+        let mut model = BuildModel::default();
+        let t1 = make_target(&mut model, "target-one");
+        let t2 = make_target(&mut model, "target-two");
+
+        let c1 = make_cross_crate(&mut model, "crate-one", t1);
+        let c2 = make_cross_crate(&mut model, "crate-two", t2);
+
+        let resolved = make_resolved(
+            t1,
+            vec![
+                ResolvedCrateRef {
+                    handle: c1,
+                    target: t1,
+                    host: false,
+                },
+                ResolvedCrateRef {
+                    handle: c2,
+                    target: t2,
+                    host: false,
+                },
+            ],
+        );
+
+        let dag = build_dag(&resolved, &model).unwrap();
+
+        // Two distinct ConfigCrate nodes.
+        let cfg1_id = *dag
+            .node_index
+            .get(&DagNode::ConfigCrate(t1))
+            .expect("ConfigCrate(t1) must exist");
+        let cfg2_id = *dag
+            .node_index
+            .get(&DagNode::ConfigCrate(t2))
+            .expect("ConfigCrate(t2) must exist");
+        assert_ne!(cfg1_id, cfg2_id, "different targets → different config nodes");
+
+        // Each cross crate depends on its own ConfigCrate.
+        let c1_id = *dag.node_index.get(&DagNode::Crate(c1)).unwrap();
+        let c2_id = *dag.node_index.get(&DagNode::Crate(c2)).unwrap();
+
+        let cfg1_outs = dag.edges_out.get(&cfg1_id).unwrap();
+        assert!(cfg1_outs.contains(&c1_id), "ConfigCrate(t1) → crate-one");
+        assert!(
+            !cfg1_outs.contains(&c2_id),
+            "ConfigCrate(t1) must NOT → crate-two"
+        );
+
+        let cfg2_outs = dag.edges_out.get(&cfg2_id).unwrap();
+        assert!(cfg2_outs.contains(&c2_id), "ConfigCrate(t2) → crate-two");
+        assert!(
+            !cfg2_outs.contains(&c1_id),
+            "ConfigCrate(t2) must NOT → crate-one"
+        );
     }
 }

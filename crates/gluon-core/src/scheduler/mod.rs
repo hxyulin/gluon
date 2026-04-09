@@ -95,18 +95,18 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
             }
 
             // ------------------------------------------------------------------
-            // ConfigCrate — generate + compile `<project>_config`.
+            // ConfigCrate — generate + compile `<project>_config` for a target.
             // ------------------------------------------------------------------
-            DagNode::ConfigCrate => {
-                // Look up the sysroot for the project's cross target.
-                // The DAG wires ConfigCrate → Sysroot(profile.target) so this
-                // lookup must always succeed.
+            DagNode::ConfigCrate(target) => {
+                // Look up the sysroot for this config crate's target.
+                // The DAG wires ConfigCrate(target) → Sysroot(target) so
+                // this lookup must always succeed.
                 let sysroot_dir = {
                     let map = self
                         .sysroots
                         .lock()
                         .map_err(|_| Error::Config("scheduler: sysroots mutex poisoned".into()))?;
-                    map.get(&self.resolved.profile.target)
+                    map.get(&target)
                         .cloned()
                         .ok_or_else(|| {
                             Error::Compile(
@@ -120,13 +120,14 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                     self.ctx,
                     self.model,
                     self.resolved,
+                    target,
                     &sysroot_dir,
                     stdout,
                 )?;
                 self.artifacts
                     .lock()
                     .map_err(|_| Error::Config("scheduler: artifacts mutex poisoned".into()))?
-                    .set_config_crate(rlib_path);
+                    .set_config_crate(target, rlib_path);
                 self.record(was_cached);
                 Ok(())
             }

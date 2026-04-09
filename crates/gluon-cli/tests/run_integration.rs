@@ -720,14 +720,12 @@ fn spawn_real_qemu_smoke() {
         .output()
         .expect("spawn gluon run");
 
-    // The stub kernel loops forever, so the timeout should fire and
-    // gluon reports QemuTimeout as a non-zero exit. However, newer QEMU
-    // versions (≥ 7.2) reject bare ELF kernels without a PVH ELF note
-    // in direct-boot mode, exiting immediately with status 1 and an
-    // "Error loading uncompressed kernel" message. Both outcomes are
-    // valid — the test's purpose is to verify that gluon's runner
-    // correctly spawns QEMU and reports the result, not that the
-    // minimal fixture's kernel actually boots.
+    // The stub kernel's PVH ELF note allows QEMU >= 7.2 to direct-boot
+    // it. The kernel loops forever, so the timeout should fire and gluon
+    // reports QemuTimeout as a non-zero exit. A QEMU load error is also
+    // acceptable (e.g. if the PVH note doesn't work on a particular QEMU
+    // build) — the test's purpose is to verify that gluon's runner
+    // correctly spawns QEMU and reports the result.
     assert!(!output.status.success(), "expected non-zero exit");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let is_timeout = stderr.to_lowercase().contains("timeout");

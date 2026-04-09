@@ -15,15 +15,15 @@
 //!
 //! ### Compilation target
 //!
-//! The config crate is compiled for the **project's cross target**
-//! (`resolved.profile.target`). Downstream cross crates consume it via
-//! `--extern`, and rustc rejects cross-target extern mixing. MVP-M has one
-//! target per project, so this trade-off is acceptable.
+//! One config crate is compiled per distinct cross target in the resolved
+//! crate list. Each target gets its own rlib under a per-target subdirectory
+//! of `generated/<project>_config/`. Downstream cross crates consume the
+//! config crate for their own target via `--extern`.
 
 use crate::compile::compile_crate::sanitise_crate_name;
 use crate::compile::{CompileCtx, Emit, RustcCommandBuilder};
 use crate::error::{Diagnostic, Error, Result};
-use gluon_model::{BuildModel, CrateType, ResolvedConfig, ResolvedValue};
+use gluon_model::{BuildModel, CrateType, Handle, ResolvedConfig, ResolvedValue, TargetDef};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -186,16 +186,17 @@ pub fn ensure_config_crate(
     ctx: &CompileCtx,
     model: &BuildModel,
     resolved: &ResolvedConfig,
+    target_handle: Handle<TargetDef>,
     sysroot_dir: &Path,
     _stdout: &mut Vec<u8>,
 ) -> Result<(String, PathBuf, bool)> {
     let layout = &ctx.layout;
 
-    // Resolve the cross target for the config crate.
-    let target = model.targets.get(resolved.profile.target).ok_or_else(|| {
+    // Resolve the cross target for this config crate instance.
+    let target = model.targets.get(target_handle).ok_or_else(|| {
         Error::Compile(format!(
-            "config crate: profile target handle {:?} not found in build model",
-            resolved.profile.target
+            "config crate: target handle {:?} not found in build model",
+            target_handle
         ))
     })?;
 
@@ -209,9 +210,10 @@ pub fn ensure_config_crate(
     // Extra-filename suffix — deterministic, matches compile_crate convention.
     let extra_filename = format!("-gluon-{crate_name}");
 
-    // Output and depfile paths. These live directly in generated_config_crate_dir
-    // (no further subdirectory) so `gluon clean` sweeps them with the directory.
-    let out_dir = layout.generated_config_crate_dir();
+    // Output and depfile paths. Per-target subdirectory under the generated
+    // config crate dir so each target gets its own compilation. `gluon clean`
+    // sweeps the entire generated directory.
+    let out_dir = layout.generated_config_crate_dir().join(&target.name);
     let output_path = out_dir.join(format!("lib{crate_name}{extra_filename}.rlib"));
     let depfile_path = out_dir.join(format!("{crate_name}{extra_filename}.d"));
 
