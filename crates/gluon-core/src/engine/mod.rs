@@ -19,6 +19,8 @@ use std::rc::Rc;
 
 mod builders;
 mod conversions;
+pub(crate) mod intern;
+pub(crate) mod validate;
 
 /// Engine state shared by all builders during a single script evaluation.
 ///
@@ -109,16 +111,26 @@ pub fn evaluate_script_raw(path: impl AsRef<Path>) -> Result<(BuildModel, Vec<Di
         .run_file(path.clone())
         .map_err(|e| Error::Script(e.to_string()))?;
 
-    let diags = std::mem::take(&mut *state.diagnostics.borrow_mut());
+    let mut diags = std::mem::take(&mut *state.diagnostics.borrow_mut());
 
     // Drop the engine so any closures holding `EngineState` clones release
     // their `Rc` references. Without this, `Rc::try_unwrap` below can't
     // succeed and we'd silently clone the model.
     drop(engine);
 
-    let model = Rc::try_unwrap(state.model)
+    let mut model = Rc::try_unwrap(state.model)
         .map(|rc| rc.into_inner())
         .unwrap_or_else(|rc| rc.borrow().clone());
+
+    // Intern pass: resolve string cross-refs to typed handles. Errors are
+    // accumulated rather than short-circuiting so the caller sees every
+    // dangling reference at once.
+    diags.extend(intern::intern(&mut model));
+
+    // Validate pass: structural checks that only make sense on an interned
+    // model (cycle detection, pipeline stage sanity, top-level presence).
+    diags.extend(validate::validate(&model));
+
     Ok((model, diags))
 }
 
@@ -616,4 +628,250 @@ mod tests {
             other => panic!("expected Error::Diagnostics, got {other:?}"),
         }
     }
+
+    // -----------------------------------------------------------------
+    // Chunk 4: intern + validate passes
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn intern_resolves_profile_target() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x86_64-unknown-test", "t.json");
+            profile("default").target("x86_64-unknown-test");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let ph = model.profiles.lookup("default").expect("profile exists");
+        let p = model.profiles.get(ph).unwrap();
+        assert_eq!(p.target_handle, model.targets.lookup("x86_64-unknown-test"));
+        assert!(p.target_handle.is_some());
+    }
+
+    #[test]
+    fn intern_resolves_profile_inherits() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            profile("base").opt_level(0);
+            profile("debug").inherits("base").opt_level(0);
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let dh = model
+            .profiles
+            .lookup("debug")
+            .expect("debug profile exists");
+        let d = model.profiles.get(dh).unwrap();
+        assert_eq!(d.inherits_handle, model.profiles.lookup("base"));
+        assert!(d.inherits_handle.is_some());
+    }
+
+    #[test]
+    fn intern_unknown_target_is_diagnostic() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            profile("default").target("nonexistent");
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter()
+                        .any(|d| d.message.contains("unknown target 'nonexistent'")
+                            && d.message.contains("profile 'default'")),
+                    "expected unknown-target diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intern_unknown_inherits_is_diagnostic() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            profile("default").inherits("nope");
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter()
+                        .any(|d| d.message.contains("unknown profile 'nope'")
+                            && d.message.contains("profile 'default'")),
+                    "expected unknown-inherits diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intern_resolves_crate_group_and_target() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x", "t.json");
+            let g = group("kernel").target("x");
+            g.add("foo", "crates/foo");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let fh = model.crates.lookup("foo").expect("foo crate exists");
+        let foo = model.crates.get(fh).unwrap();
+        assert_eq!(foo.group_handle, model.groups.lookup("kernel"));
+        assert!(foo.group_handle.is_some());
+
+        let kh = model.groups.lookup("kernel").expect("kernel group exists");
+        let kernel = model.groups.get(kh).unwrap();
+        assert_eq!(kernel.target_handle, model.targets.lookup("x"));
+        assert!(kernel.target_handle.is_some());
+    }
+
+    #[test]
+    fn intern_resolves_dep_to_project_crate() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x", "t.json");
+            let g = group("k").target("x");
+            g.add("lib", "crates/lib");
+            g.add("app", "crates/app").deps(#{ lib: #{ crate: "lib" } });
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let ah = model.crates.lookup("app").expect("app crate exists");
+        let app = model.crates.get(ah).unwrap();
+        let dep = app.deps.get("lib").expect("lib dep exists");
+        assert_eq!(dep.crate_handle, model.crates.lookup("lib"));
+        assert!(dep.crate_handle.is_some());
+    }
+
+    #[test]
+    fn intern_resolves_dep_to_external() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x", "t.json");
+            dependency("log").version("0.4");
+            let g = group("k").target("x");
+            g.add("app", "crates/app").deps(#{ log: #{ crate: "log" } });
+            "#,
+        );
+        let (model, diags) = evaluate_script_raw(f.path()).expect("script runs");
+        let ah = model.crates.lookup("app").expect("app crate exists");
+        let app = model.crates.get(ah).unwrap();
+        let dep = app.deps.get("log").expect("log dep exists");
+        assert!(
+            dep.crate_handle.is_none(),
+            "external dep should leave crate_handle as None, got {:?}",
+            dep.crate_handle
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("unknown crate")),
+            "external dep should not produce a dangling-dep diagnostic, got: {diags:#?}"
+        );
+    }
+
+    #[test]
+    fn intern_unknown_dep_is_diagnostic() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x", "t.json");
+            let g = group("k").target("x");
+            g.add("app", "crates/app").deps(#{ foo: #{ crate: "nonexistent" } });
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter()
+                        .any(|d| d.message.contains("unknown crate 'nonexistent'")
+                            && d.message.contains("app")),
+                    "expected unknown-crate diagnostic mentioning app, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intern_resolves_pipeline_stage_inputs() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x", "t.json");
+            let g = group("k").target("x");
+            g.add("a", "crates/a");
+            pipeline().stage("k", ["k"]);
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let ph = model
+            .pipelines
+            .lookup("main")
+            .expect("main pipeline exists");
+        let p = model.pipelines.get(ph).unwrap();
+        assert_eq!(p.stages.len(), 1);
+        assert_eq!(p.stages[0].inputs_handles.len(), 1);
+        assert_eq!(p.stages[0].inputs_handles[0], model.groups.lookup("k"));
+        assert!(p.stages[0].inputs_handles[0].is_some());
+    }
+
+    #[test]
+    fn validate_detects_profile_cycle() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            profile("a").inherits("b");
+            profile("b").inherits("a");
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter().any(|d| d.message.contains("cycle")
+                        && d.message.contains("a")
+                        && d.message.contains("b")),
+                    "expected profile cycle diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_requires_project() {
+        // Note: the script still has to parse, so we use a no-op statement.
+        let f = write_script(
+            r#"
+            target("x", "t.json");
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter().any(
+                        |d| d.message.contains("project") && d.message.contains("must declare")
+                    ),
+                    "expected project-required diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    // TODO: test pipeline rule resolution when PipelineStep.rule has a
+    // script-facing setter (currently the rhai pipeline builder does not
+    // expose one, so there's no way to construct an invalid reference).
 }

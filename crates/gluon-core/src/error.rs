@@ -44,6 +44,17 @@ impl Diagnostic {
         self
     }
 
+    /// Attach a span if `Some`, otherwise leave the diagnostic unchanged.
+    ///
+    /// Useful when the caller has an `Option<SourceSpan>` field (as most
+    /// model items do) and wants to forward it without a manual `match`.
+    pub fn with_optional_span(mut self, span: Option<SourceSpan>) -> Self {
+        if let Some(s) = span {
+            self.span = Some(s);
+        }
+        self
+    }
+
     pub fn with_note(mut self, note: impl Into<String>) -> Self {
         self.notes.push(note.into());
         self
