@@ -20,7 +20,6 @@
 //! `--extern`, and rustc rejects cross-target extern mixing. MVP-M has one
 //! target per project, so this trade-off is acceptable.
 
-use crate::cache::{BuildRecord, FreshnessQuery, parse_depfile};
 use crate::compile::compile_crate::sanitise_crate_name;
 use crate::compile::{CompileCtx, Emit, RustcCommandBuilder};
 use crate::error::{Diagnostic, Error, Result};
@@ -254,7 +253,7 @@ pub fn ensure_config_crate(
         .target(&target.spec, target.builtin)
         .sysroot(sysroot_dir)
         .out_dir(&out_dir)
-        .emit(&[Emit::Link, Emit::Metadata, Emit::DepInfo])
+        .emit_with_dep_info_path(&[Emit::Link, Emit::Metadata, Emit::DepInfo], &depfile_path)
         .incremental(&incremental_dir)
         .opt_level(resolved.profile.opt_level)
         .debug_info(resolved.profile.debug_info);
@@ -281,111 +280,55 @@ pub fn ensure_config_crate(
         .raw_arg("-C")
         .raw_arg(format!("extra-filename={extra_filename}"));
 
-    // --- Cache integration (mirrors sysroot::build_sysroot_crate) ---
+    // --- Cache integration (delegated to compile::compile_and_cache) ---
     let argv_hash = builder.hash();
     let cache_key = format!("config_crate:{}:{}", crate_name, target.name);
 
-    // Seed the source list from the previous run's depfile. On a cold
-    // build this is empty (fine — cache entry doesn't exist either, so
-    // is_fresh returns false regardless).
-    let sources_for_query: Vec<PathBuf> = if depfile_path.exists() {
-        parse_depfile(&depfile_path).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let crate_name_fail = crate_name.clone();
+    let crate_name_depfile = crate_name.clone();
+    let target_name_fail = target.name.clone();
+    let depfile_for_diag = depfile_path.clone();
 
-    // Narrow cache-lock acquisition (read).
-    let is_fresh = {
-        let mut cache = ctx
-            .cache
-            .lock()
-            .map_err(|_| Error::Config("cache mutex poisoned".into()))?;
-        cache.is_fresh(&FreshnessQuery {
-            key: &cache_key,
-            argv_hash,
-            sources: &sources_for_query,
-            output_path: &output_path,
-        })
-    };
-
-    if is_fresh && output_path.exists() {
-        return Ok((crate_name, output_path, true));
-    }
-
-    // Slow path: create the output directory and spawn rustc.
-    //
-    // Render the argv string BEFORE consuming the builder so the error path
-    // can include the full invocation without needing an extra clone.
-    fs::create_dir_all(&out_dir).map_err(|e| Error::Io {
-        path: out_dir.clone(),
-        source: e,
-    })?;
-
-    let rustc_path = ctx.rustc_info.rustc_path.clone();
-    let argv_snapshot: Vec<std::ffi::OsString> = builder.args().to_vec();
-    let render_cmd = || -> String {
-        let mut s = rustc_path.display().to_string();
-        for arg in &argv_snapshot {
-            s.push(' ');
-            s.push_str(&format!("{arg:?}"));
-        }
-        s
-    };
-
-    let mut cmd = builder.into_command();
-    let output = cmd.output().map_err(|e| Error::Io {
-        path: ctx.rustc_info.rustc_path.clone(),
-        source: e,
-    })?;
-    if !output.status.success() {
-        return Err(Error::Diagnostics(vec![
-            Diagnostic::error(format!(
-                "rustc failed while building config crate '{}' for target '{}': exit={:?}",
-                crate_name,
-                target.name,
-                output.status.code(),
-            ))
-            .with_note(format!(
-                "stderr:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-            .with_note(format!("command: {}", render_cmd())),
-        ]));
-    }
-
-    // Parse the depfile to record sources. If parsing fails, the rlib is on
-    // disk but the cache entry is not written — the next run re-spawns rustc.
-    // That's merely wasteful, not incorrect, so we surface a clear diagnostic.
-    let sources = parse_depfile(&depfile_path).map_err(|e| {
-        Error::Diagnostics(vec![
-            Diagnostic::error(format!(
-                "built config crate '{}' but its depfile at {} could not be read",
-                crate_name,
-                depfile_path.display(),
-            ))
-            .with_note(format!("underlying error: {e}"))
-            .with_note(
-                "config crate rlib is on disk but cache not updated; \
+    let (output_path, was_cached) = crate::compile::run_compile_and_cache(
+        ctx,
+        builder,
+        argv_hash,
+        cache_key,
+        output_path,
+        depfile_path,
+        Some(&out_dir),
+        Box::new(move |output, rendered| {
+            Error::Diagnostics(vec![
+                Diagnostic::error(format!(
+                    "rustc failed while building config crate '{}' for target '{}': exit={:?}",
+                    crate_name_fail,
+                    target_name_fail,
+                    output.status.code(),
+                ))
+                .with_note(format!(
+                    "stderr:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                ))
+                .with_note(format!("command: {rendered}")),
+            ])
+        }),
+        Box::new(move |e| {
+            Error::Diagnostics(vec![
+                Diagnostic::error(format!(
+                    "built config crate '{}' but its depfile at {} could not be read",
+                    crate_name_depfile,
+                    depfile_for_diag.display(),
+                ))
+                .with_note(format!("underlying error: {e}"))
+                .with_note(
+                    "config crate rlib is on disk but cache not updated; \
              the next run will re-spawn rustc for this crate",
-            ),
-        ])
-    })?;
+                ),
+            ])
+        }),
+    )?;
 
-    // Narrow cache-lock acquisition (write).
-    {
-        let mut cache = ctx
-            .cache
-            .lock()
-            .map_err(|_| Error::Config("cache mutex poisoned".into()))?;
-        cache.mark_built(BuildRecord {
-            key: cache_key,
-            argv_hash,
-            sources,
-            output_path: output_path.clone(),
-        })?;
-    }
-
-    Ok((crate_name, output_path, false))
+    Ok((crate_name, output_path, was_cached))
 }
 
 // ---------------------------------------------------------------------------

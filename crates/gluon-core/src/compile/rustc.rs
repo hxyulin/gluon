@@ -154,9 +154,45 @@ impl RustcCommandBuilder {
     /// One-shot: calling more than once will cause rustc to reject the
     /// invocation.
     pub fn emit(&mut self, kinds: &[Emit]) -> &mut Self {
-        let joined: Vec<&'static str> = kinds.iter().map(|k| k.as_str()).collect();
+        self.emit_inner(kinds, None)
+    }
+
+    /// Like [`RustcCommandBuilder::emit`], but routes the dep-info output to an explicit path via
+    /// `--emit=...,dep-info=<path>`. The caller is responsible for ensuring
+    /// [`Emit::DepInfo`] appears in `kinds` (debug-asserted).
+    ///
+    /// Why this exists: rustc otherwise derives the depfile path from
+    /// `--out-dir` + the crate name (plus any `-C extra-filename`), which
+    /// works but is implicit — the caller has to reconstruct the exact
+    /// filename rustc will choose. Making the path explicit eliminates that
+    /// coupling and documents where the depfile lands in one place.
+    ///
+    /// One-shot: calling more than once will cause rustc to reject the
+    /// invocation.
+    pub fn emit_with_dep_info_path(&mut self, kinds: &[Emit], dep_info: &Path) -> &mut Self {
+        debug_assert!(
+            kinds.contains(&Emit::DepInfo),
+            "emit_with_dep_info_path called without Emit::DepInfo in kinds: {kinds:?}"
+        );
+        self.emit_inner(kinds, Some(dep_info))
+    }
+
+    fn emit_inner(&mut self, kinds: &[Emit], dep_info: Option<&Path>) -> &mut Self {
         let mut s = OsString::from("--emit=");
-        s.push(joined.join(","));
+        let mut first = true;
+        for k in kinds {
+            if !first {
+                s.push(",");
+            }
+            first = false;
+            match (k, dep_info) {
+                (Emit::DepInfo, Some(path)) => {
+                    s.push("dep-info=");
+                    s.push(path.as_os_str());
+                }
+                _ => s.push(k.as_str()),
+            }
+        }
         self.args.push(s);
         self
     }
@@ -369,6 +405,26 @@ mod tests {
         let mut bld = b("/usr/bin/rustc");
         bld.emit(&[Emit::Link, Emit::DepInfo, Emit::Metadata]);
         assert_eq!(bld.args(), &[os("--emit=link,dep-info,metadata")]);
+    }
+
+    #[test]
+    fn emit_with_dep_info_path_inlines_path_into_single_token() {
+        let mut bld = b("/usr/bin/rustc");
+        bld.emit_with_dep_info_path(
+            &[Emit::Link, Emit::Metadata, Emit::DepInfo],
+            Path::new("/tmp/out/crate.d"),
+        );
+        assert_eq!(
+            bld.args(),
+            &[os("--emit=link,metadata,dep-info=/tmp/out/crate.d")]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "emit_with_dep_info_path called without Emit::DepInfo")]
+    fn emit_with_dep_info_path_requires_dep_info_kind() {
+        let mut bld = b("/usr/bin/rustc");
+        bld.emit_with_dep_info_path(&[Emit::Link, Emit::Metadata], Path::new("/tmp/foo.d"));
     }
 
     #[test]

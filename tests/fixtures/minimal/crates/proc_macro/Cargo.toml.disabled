@@ -1,0 +1,7 @@
+# This Cargo.toml is intentionally disabled — gluon compiles directly from
+# gluon.rhai, not Cargo manifests. The file is kept around (renamed) purely
+# as documentation for humans browsing the fixture tree.
+[package]
+name = "minimal-derive"
+version = "0.1.0"
+edition = "2021"

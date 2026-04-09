@@ -37,7 +37,6 @@
 //! accidentally depend on internals of the sysroot crates as if they were
 //! stable. Both are standard for custom-sysroot flows.
 
-use crate::cache::{BuildRecord, FreshnessQuery, parse_depfile};
 use crate::compile::{CompileCtx, Emit, RustcCommandBuilder};
 use crate::error::{Diagnostic, Error, Result};
 use gluon_model::{CrateType, TargetDef};
@@ -221,7 +220,7 @@ fn build_sysroot_crate(
         .input(&src_path)
         .target(&target.spec, target.builtin)
         .out_dir(sysroot_lib_dir)
-        .emit(&[Emit::Link, Emit::Metadata, Emit::DepInfo])
+        .emit_with_dep_info_path(&[Emit::Link, Emit::Metadata, Emit::DepInfo], &depfile_path)
         .incremental(&incremental_dir)
         // Sysroot crates are always optimised — bare-metal code
         // performance is never worth trading for a faster sysroot build.
@@ -275,122 +274,55 @@ fn build_sysroot_crate(
     let argv_hash = builder.hash();
     let cache_key = format!("sysroot:{}:{}", target.name, crate_name);
 
-    // Best-effort sources list for the cache query: on a cold build the
-    // depfile doesn't exist yet and `sources` is empty, which is fine
-    // because the cache entry also doesn't exist and `is_fresh` will
-    // return false anyway. On a warm build we seed it from the previous
-    // build's depfile so the freshness check has something to verify.
-    let sources_for_query: Vec<PathBuf> = if depfile_path.exists() {
-        parse_depfile(&depfile_path).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    // Cache lookup. Acquire narrowly so we don't hold the lock across
-    // the rustc spawn below.
-    let is_fresh = {
-        let mut cache = ctx
-            .cache
-            .lock()
-            .map_err(|_| Error::Config("cache mutex poisoned".into()))?;
-        cache.is_fresh(&FreshnessQuery {
-            key: &cache_key,
-            argv_hash,
-            sources: &sources_for_query,
-            output_path: &output_rlib,
-        })
-    };
-
-    if is_fresh && output_rlib.exists() {
-        return Ok(output_rlib);
-    }
-
-    // Slow path: actually run rustc.
-    //
-    // We render the argv to a shell-friendly string BEFORE consuming the
-    // builder with `into_command()`, because on the error path we want
-    // to include the full rustc invocation in the diagnostic so
-    // flag-assembly bugs (`error: unknown argument '--foo'`) are easy to
-    // debug. The closure defers the allocation so the common success
-    // path pays nothing for this.
-    let rustc_path = ctx.rustc_info.rustc_path.clone();
-    let argv_snapshot: Vec<std::ffi::OsString> = builder.args().to_vec();
-    let render_cmd = || -> String {
-        let mut s = rustc_path.display().to_string();
-        for arg in &argv_snapshot {
-            s.push(' ');
-            // Debug formatting gives robust cross-platform quoting of
-            // OsStr values that may contain spaces or shell metachars.
-            s.push_str(&format!("{arg:?}"));
-        }
-        s
-    };
-
-    let mut cmd = builder.into_command();
-    let output = cmd.output().map_err(|e| Error::Io {
-        path: ctx.rustc_info.rustc_path.clone(),
-        source: e,
-    })?;
-    if !output.status.success() {
-        return Err(Error::Diagnostics(vec![
-            Diagnostic::error(format!(
-                "rustc failed while building sysroot crate '{}' for target '{}': exit={:?}",
-                crate_name,
-                target.name,
-                output.status.code(),
-            ))
-            .with_note(format!(
-                "stderr:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-            .with_note(format!("command: {}", render_cmd())),
-        ]));
-    }
-
-    // Parse the just-emitted depfile for the source set we'll record.
-    //
-    // Note the ordering hazard: we parse the depfile AFTER rustc has
-    // written the rlib, but BEFORE we write the cache entry. If this
-    // parse fails, the rlib is already on disk but the cache has no
-    // record of it — the next run will cache-miss and re-spawn rustc
-    // from scratch. That's merely wasteful, not incorrect, so we leave
-    // it for now and surface a clear diagnostic so the user knows why
-    // the build is being invalidated.
-    //
-    // TODO(session-B): reorder to parse the depfile before committing
-    // the rlib. That requires `--emit=dep-info=<tmp_path>` with an
-    // explicit temporary path so we can read the deps before the final
-    // output is in place, which is a larger refactor than this chunk.
-    let sources = parse_depfile(&depfile_path).map_err(|e| {
-        Error::Diagnostics(vec![
-            Diagnostic::error(format!(
-                "built sysroot crate '{}' for target '{}' but its depfile at {} could not be read",
-                crate_name,
-                target.name,
-                depfile_path.display(),
-            ))
-            .with_note(format!("underlying error: {e}"))
-            .with_note(
-                "the rlib is on disk but the cache was not updated; \
-                 the next run will re-spawn rustc for this crate",
-            ),
-        ])
-    })?;
-
-    {
-        let mut cache = ctx
-            .cache
-            .lock()
-            .map_err(|_| Error::Config("cache mutex poisoned".into()))?;
-        cache.mark_built(BuildRecord {
-            key: cache_key,
-            argv_hash,
-            sources,
-            output_path: output_rlib.clone(),
-        })?;
-    }
-
-    Ok(output_rlib)
+    // Delegate the freshness → spawn → depfile → mark_built sequence to
+    // the shared helper. Sysroot crates create their `sysroot_lib_dir`
+    // once per target in `build_sysroot` above, so `out_dir_to_create`
+    // is `None` here — there is nothing for the helper to mkdir.
+    let crate_name_fail = crate_name.to_string();
+    let crate_name_depfile = crate_name.to_string();
+    let target_name_fail = target.name.clone();
+    let target_name_depfile = target.name.clone();
+    let depfile_for_diag = depfile_path.clone();
+    let (path, _was_cached) = crate::compile::run_compile_and_cache(
+        ctx,
+        builder,
+        argv_hash,
+        cache_key,
+        output_rlib,
+        depfile_path,
+        None,
+        Box::new(move |output, rendered| {
+            Error::Diagnostics(vec![
+                Diagnostic::error(format!(
+                    "rustc failed while building sysroot crate '{}' for target '{}': exit={:?}",
+                    crate_name_fail,
+                    target_name_fail,
+                    output.status.code(),
+                ))
+                .with_note(format!(
+                    "stderr:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                ))
+                .with_note(format!("command: {rendered}")),
+            ])
+        }),
+        Box::new(move |e| {
+            Error::Diagnostics(vec![
+                Diagnostic::error(format!(
+                    "built sysroot crate '{}' for target '{}' but its depfile at {} could not be read",
+                    crate_name_depfile,
+                    target_name_depfile,
+                    depfile_for_diag.display(),
+                ))
+                .with_note(format!("underlying error: {e}"))
+                .with_note(
+                    "the rlib is on disk but the cache was not updated; \
+                     the next run will re-spawn rustc for this crate",
+                ),
+            ])
+        }),
+    )?;
+    Ok(path)
 }
 
 /// Lowercase hex encoding of a 32-byte digest. Local helper to avoid

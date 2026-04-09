@@ -444,11 +444,14 @@ fn execute_parallel(
 fn error_message(e: &Error) -> String {
     match e {
         Error::Compile(msg) | Error::Config(msg) | Error::Script(msg) => msg.clone(),
+        // Render each diagnostic in full via its Display impl so notes
+        // (rustc stderr, command, etc.) survive the node wrapping. Joining
+        // with "\n" keeps multi-diagnostic errors readable.
         Error::Diagnostics(diags) => diags
             .iter()
-            .map(|d| d.message.clone())
+            .map(|d| d.to_string())
             .collect::<Vec<_>>()
-            .join("; "),
+            .join("\n"),
         Error::Io { path, source } => format!("I/O error at {}: {}", path.display(), source),
     }
 }

@@ -14,11 +14,14 @@
 //! - [`CompileCtx`] — the triple of layout + rustc info + cache that every
 //!   compile step (sysroot, host crates, cross crates) threads through.
 
+pub mod compile_and_cache;
 pub mod compile_crate;
 pub mod extern_map;
 pub mod layout;
 pub mod rustc;
 pub mod rustc_info;
+
+pub(crate) use compile_and_cache::compile_and_cache as run_compile_and_cache;
 
 pub use compile_crate::{CompileCrateInput, compile as compile_crate};
 pub use extern_map::ArtifactMap;

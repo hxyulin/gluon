@@ -29,11 +29,11 @@
 //! Keeping this order stable is non-negotiable: any reordering of the
 //! flags invalidates every on-disk cache entry.
 
-use crate::cache::{BuildRecord, FreshnessQuery, parse_depfile};
+#[cfg(test)]
+use crate::cache::BuildRecord;
 use crate::compile::{ArtifactMap, CompileCtx, Emit, RustcCommandBuilder};
 use crate::error::{Diagnostic, Error, Result};
 use gluon_model::{BuildModel, CrateDef, CrateType, ResolvedConfig, ResolvedCrateRef};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Input bundle for [`compile`]. Grouped into a struct so the function
@@ -251,12 +251,15 @@ pub(crate) fn build_rustc_command(
         }
     }
 
-    // Emit flags.
+    // Emit flags. The depfile path is threaded in explicitly so rustc writes
+    // it to a location we control, rather than deriving it from --out-dir +
+    // crate name + extra-filename. This keeps the "where does the .d land?"
+    // knowledge in one place (the `depfile_path` bound above).
     let emit_kinds: &[Emit] = match crate_def.crate_type {
         CrateType::Bin => &[Emit::Link, Emit::DepInfo],
         _ => &[Emit::Link, Emit::Metadata, Emit::DepInfo],
     };
-    builder.emit(emit_kinds);
+    builder.emit_with_dep_info_path(emit_kinds, &depfile_path);
 
     // Explicit dependencies (BTreeMap order = deterministic argv order).
     for (extern_name, dep_def) in &crate_def.deps {
@@ -396,46 +399,16 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<(PathBu
         )
     };
 
-    // Seed the source list from the previous run's depfile if it exists.
-    // On a cold build this will be empty (the depfile doesn't exist yet),
-    // which is fine — the cache entry doesn't exist either so `is_fresh`
-    // returns false regardless.
-    let sources_for_query: Vec<PathBuf> = if depfile_path.exists() {
-        parse_depfile(&depfile_path).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    // --- Narrow cache-lock acquisition (read) ---
-    let is_fresh = {
-        let mut cache = ctx
-            .cache
-            .lock()
-            .map_err(|_| Error::Config("cache mutex poisoned".into()))?;
-        cache.is_fresh(&FreshnessQuery {
-            key: &cache_key,
-            argv_hash,
-            sources: &sources_for_query,
-            output_path: &output_path,
-        })
-    };
-
-    if is_fresh && output_path.exists() {
-        return Ok((output_path, true));
-    }
-
-    // Slow path: create the output directory and spawn rustc.
-    //
-    // We render the argv to a string BEFORE consuming the builder with
-    // `into_command()`, because on the error path we want to include the
-    // full rustc invocation in the diagnostic so flag-assembly bugs are
-    // easy to debug. The closure defers the allocation so the common
-    // success path pays nothing for this.
+    // Derive the out-dir that must exist on the slow path before rustc
+    // writes its artifact. This used to live in the body of the
+    // pre-extraction slow path; hoisting it up so the shared helper can
+    // mkdir it preserves the original ordering (cache check first, then
+    // mkdir, then spawn).
     let out_dir = if crate_ref.host {
         ctx.layout.host_artifact_dir(crate_def)
     } else if crate_def.crate_type == CrateType::Bin {
         // Cross Bin crates use cross_final_dir as --out-dir (see
-        // build_rustc_command comment). Create it here before spawning rustc.
+        // build_rustc_command comment).
         let target = model.targets.get(crate_ref.target).ok_or_else(|| {
             Error::Compile(format!(
                 "crate '{}': target handle not found when creating output directory",
@@ -453,95 +426,74 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<(PathBu
         ctx.layout
             .cross_artifact_dir(target, &resolved.profile, crate_def)
     };
-    fs::create_dir_all(&out_dir).map_err(|e| Error::Io {
-        path: out_dir.clone(),
-        source: e,
-    })?;
 
-    let rustc_path = ctx.rustc_info.rustc_path.clone();
-    let argv_snapshot: Vec<std::ffi::OsString> = builder.args().to_vec();
-    let render_cmd = || -> String {
-        let mut s = rustc_path.display().to_string();
-        for arg in &argv_snapshot {
-            s.push(' ');
-            s.push_str(&format!("{arg:?}"));
-        }
-        s
-    };
-
-    let mut cmd = builder.into_command();
-    let output = cmd.output().map_err(|e| Error::Io {
-        path: ctx.rustc_info.rustc_path.clone(),
-        source: e,
-    })?;
-    if !output.status.success() {
-        // For cross crates we name the target in the headline so
-        // multi-target builds don't force the user to dig through the
-        // command to see which rustc invocation actually failed.
-        let headline = if crate_ref.host {
-            format!(
-                "rustc failed while building host crate '{}': exit={:?}",
-                crate_name,
-                output.status.code(),
-            )
-        } else {
-            let target_name = model
+    // Build the error-headline closures up front so we can capture the
+    // crate / target naming context by value. For cross crates we name
+    // the target in the headline so multi-target builds don't force the
+    // user to dig through the command to see which invocation failed.
+    let crate_name_fail = crate_name.clone();
+    let crate_name_depfile = crate_name.clone();
+    let is_host = crate_ref.host;
+    let target_name_for_fail = if crate_ref.host {
+        None
+    } else {
+        Some(
+            model
                 .targets
                 .get(crate_ref.target)
-                .map(|t| t.name.as_str())
-                .unwrap_or("<unknown>");
-            format!(
-                "rustc failed while building crate '{}' for target '{}': exit={:?}",
-                crate_name,
-                target_name,
-                output.status.code(),
-            )
-        };
-        return Err(Error::Diagnostics(vec![
-            Diagnostic::error(headline)
-                .with_note(format!(
-                    "stderr:\n{}",
-                    String::from_utf8_lossy(&output.stderr)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+        )
+    };
+    let depfile_for_diag = depfile_path.clone();
+
+    crate::compile::run_compile_and_cache(
+        ctx,
+        builder,
+        argv_hash,
+        cache_key,
+        output_path,
+        depfile_path,
+        Some(&out_dir),
+        Box::new(move |output, rendered| {
+            let headline = if is_host {
+                format!(
+                    "rustc failed while building host crate '{}': exit={:?}",
+                    crate_name_fail,
+                    output.status.code(),
+                )
+            } else {
+                format!(
+                    "rustc failed while building crate '{}' for target '{}': exit={:?}",
+                    crate_name_fail,
+                    target_name_for_fail.as_deref().unwrap_or("<unknown>"),
+                    output.status.code(),
+                )
+            };
+            Error::Diagnostics(vec![
+                Diagnostic::error(headline)
+                    .with_note(format!(
+                        "stderr:\n{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ))
+                    .with_note(format!("command: {rendered}")),
+            ])
+        }),
+        Box::new(move |e| {
+            Error::Diagnostics(vec![
+                Diagnostic::error(format!(
+                    "built crate '{}' but its depfile at {} could not be read",
+                    crate_name_depfile,
+                    depfile_for_diag.display(),
                 ))
-                .with_note(format!("command: {}", render_cmd())),
-        ]));
-    }
-
-    // Parse the depfile for the source set to record. If parsing fails,
-    // the artifact is already on disk but the cache has no entry for it —
-    // the next run will miss the cache and re-spawn rustc. That's merely
-    // wasteful, not incorrect, so we surface a clear diagnostic rather
-    // than silently ignoring the error.
-    let sources = parse_depfile(&depfile_path).map_err(|e| {
-        Error::Diagnostics(vec![
-            Diagnostic::error(format!(
-                "built crate '{}' but its depfile at {} could not be read",
-                crate_name,
-                depfile_path.display(),
-            ))
-            .with_note(format!("underlying error: {e}"))
-            .with_note(
-                "the artifact is on disk but the cache was not updated; \
-                 the next run will re-spawn rustc for this crate",
-            ),
-        ])
-    })?;
-
-    // --- Narrow cache-lock acquisition (write) ---
-    {
-        let mut cache = ctx
-            .cache
-            .lock()
-            .map_err(|_| Error::Config("cache mutex poisoned".into()))?;
-        cache.mark_built(BuildRecord {
-            key: cache_key,
-            argv_hash,
-            sources,
-            output_path: output_path.clone(),
-        })?;
-    }
-
-    Ok((output_path, false))
+                .with_note(format!("underlying error: {e}"))
+                .with_note(
+                    "the artifact is on disk but the cache was not updated; \
+                     the next run will re-spawn rustc for this crate",
+                ),
+            ])
+        }),
+    )
 }
 
 /// Sanitise an arbitrary string to a valid Rust identifier component.
