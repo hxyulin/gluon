@@ -82,3 +82,116 @@ pub(crate) fn sanitise_crate_name(s: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── sanitise_crate_name ──────────────────────────────────────────
+
+    #[test]
+    fn sanitise_alphanumeric_passthrough() {
+        assert_eq!(sanitise_crate_name("hello123"), "hello123");
+    }
+
+    #[test]
+    fn sanitise_uppercase_to_lowercase() {
+        assert_eq!(sanitise_crate_name("MyKernel"), "mykernel");
+    }
+
+    #[test]
+    fn sanitise_dashes_to_underscores() {
+        assert_eq!(sanitise_crate_name("my-kernel"), "my_kernel");
+    }
+
+    #[test]
+    fn sanitise_dots_and_spaces() {
+        assert_eq!(sanitise_crate_name("my.kernel lib"), "my_kernel_lib");
+    }
+
+    #[test]
+    fn sanitise_mixed_invalid_chars() {
+        assert_eq!(
+            sanitise_crate_name("Hello-World.2024!"),
+            "hello_world_2024_"
+        );
+    }
+
+    #[test]
+    fn sanitise_empty_string() {
+        assert_eq!(sanitise_crate_name(""), "");
+    }
+
+    // ── exe_suffix_for_target ────────────────────────────────────────
+
+    #[test]
+    fn suffix_bare_metal() {
+        assert_eq!(exe_suffix_for_target("x86_64-unknown-none"), "");
+    }
+
+    #[test]
+    fn suffix_uefi() {
+        assert_eq!(exe_suffix_for_target("x86_64-unknown-uefi"), ".efi");
+    }
+
+    #[test]
+    fn suffix_uefi_mid_triple() {
+        assert_eq!(
+            exe_suffix_for_target("aarch64-unknown-uefi-something"),
+            ".efi"
+        );
+    }
+
+    #[test]
+    fn suffix_windows() {
+        assert_eq!(exe_suffix_for_target("x86_64-pc-windows-msvc"), ".exe");
+    }
+
+    #[test]
+    fn suffix_wasm32() {
+        assert_eq!(exe_suffix_for_target("wasm32-unknown-unknown"), ".wasm");
+    }
+
+    #[test]
+    fn suffix_wasm64() {
+        assert_eq!(exe_suffix_for_target("wasm64-unknown-unknown"), ".wasm");
+    }
+
+    #[test]
+    fn suffix_linux() {
+        assert_eq!(exe_suffix_for_target("x86_64-unknown-linux-gnu"), "");
+    }
+
+    #[test]
+    fn suffix_macos() {
+        assert_eq!(exe_suffix_for_target("aarch64-apple-darwin"), "");
+    }
+
+    #[test]
+    fn suffix_custom_spec() {
+        assert_eq!(exe_suffix_for_target("my-custom-target"), "");
+    }
+
+    // ── normalize_crate_name ─────────────────────────────────────────
+
+    #[test]
+    fn normalize_no_dashes_borrows() {
+        let result = normalize_crate_name("hello");
+        assert_eq!(result, "hello");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn normalize_with_dashes_owns() {
+        let result = normalize_crate_name("my-kernel");
+        assert_eq!(result, "my_kernel");
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn normalize_underscores_untouched_borrows() {
+        let result = normalize_crate_name("my_kernel");
+        assert_eq!(result, "my_kernel");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+}

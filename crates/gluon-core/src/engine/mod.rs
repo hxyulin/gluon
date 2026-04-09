@@ -1207,4 +1207,148 @@ mod tests {
         assert_eq!(pipeline.stages.len(), 1);
         assert_eq!(pipeline.stages[0].rule.as_deref(), Some("my_rule"));
     }
+
+    #[test]
+    fn config_value_type_mismatch_is_diagnosed() {
+        let f = write_script(
+            r#"
+            project("test", "0.1.0");
+            target("x86_64-unknown-test", "targets/x.json");
+            config_str("MY_OPT");
+            profile("debug").set("MY_OPT", true);
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("type mismatch should fail");
+        // Rhai cannot find a `set` overload for (ProfileBuilder, String, bool),
+        // so this surfaces as a Script error rather than a Diagnostics error.
+        match err {
+            Error::Script(msg) => {
+                assert!(
+                    msg.contains("Function not found") && msg.contains("set"),
+                    "expected function-not-found for set, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Script, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_u32_negative_value_is_diagnosed() {
+        let f = write_script(
+            r#"
+            project("test", "0.1.0");
+            target("x86_64-unknown-test", "targets/x.json");
+            config_u32("COUNT");
+            profile("debug").set("COUNT", -1);
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("negative u32 should fail");
+        // Rhai sees -1 as i64, so no `set(ProfileBuilder, String, i64)` overload
+        // exists — this is a Script error, not Diagnostics.
+        match err {
+            Error::Script(msg) => {
+                assert!(
+                    msg.contains("Function not found") && msg.contains("set"),
+                    "expected function-not-found for set, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Script, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_tristate_invalid_variant_is_diagnosed() {
+        let f = write_script(
+            r#"
+            project("test", "0.1.0");
+            target("x86_64-unknown-test", "targets/x.json");
+            config_tristate("FEAT");
+            profile("debug").set("FEAT", "maybe");
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("invalid tristate should fail");
+        // Tristate options accept only specific Dynamic variants via Rhai;
+        // passing a bare string hits a function-not-found error.
+        match err {
+            Error::Script(msg) => {
+                assert!(
+                    msg.contains("Function not found") && msg.contains("set"),
+                    "expected function-not-found for set, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Script, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dep_features_wrong_type_is_diagnosed() {
+        let f = write_script(
+            r#"
+            project("test", "0.1.0");
+            target("x86_64-unknown-test", "targets/x.json");
+            let g = group("k").target("x86_64-unknown-test");
+            g.add("foo", "crates/foo")
+                .deps(#{ bar: #{ crate: "bar", features: "not-an-array" } });
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("string features should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter()
+                        .any(|d| d.message.contains("features") && d.message.contains("array")),
+                    "expected features-type diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dep_missing_crate_field_is_diagnosed() {
+        let f = write_script(
+            r#"
+            project("test", "0.1.0");
+            target("x86_64-unknown-test", "targets/x.json");
+            let g = group("k").target("x86_64-unknown-test");
+            g.add("foo", "crates/foo")
+                .deps(#{ bar: #{ features: ["std"] } });
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("missing crate field should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter()
+                        .any(|d| d.message.contains("missing") && d.message.contains("crate")),
+                    "expected missing-crate diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dep_optional_wrong_type_is_diagnosed() {
+        let f = write_script(
+            r#"
+            project("test", "0.1.0");
+            target("x86_64-unknown-test", "targets/x.json");
+            let g = group("k").target("x86_64-unknown-test");
+            g.add("foo", "crates/foo")
+                .deps(#{ bar: #{ crate: "bar", optional: "yes" } });
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("string optional should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter()
+                        .any(|d| d.message.contains("optional") && d.message.contains("bool")),
+                    "expected optional-type diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
 }
