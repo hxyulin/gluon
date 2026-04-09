@@ -11,7 +11,9 @@
 //! The `CompileCtx` that threads these together lands in a later chunk.
 
 pub mod layout;
+pub mod rustc;
 pub mod rustc_info;
 
 pub use layout::BuildLayout;
+pub use rustc::{Emit, RustcCommandBuilder};
 pub use rustc_info::RustcInfo;

@@ -10,7 +10,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 
-pub use compile::{BuildLayout, RustcInfo};
+pub use compile::{BuildLayout, Emit, RustcCommandBuilder, RustcInfo};
 pub use config::resolve;
 pub use engine::evaluate_script;
 pub use error::{Diagnostic, Error, Level, Result};
