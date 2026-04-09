@@ -4,7 +4,7 @@
 //! whether the current `vendor/` state is in sync with what the model
 //! declares. If the fingerprint in `gluon.lock` matches
 //! [`fingerprint_external_deps`] applied to the live
-//! [`BuildModel::external_deps`], the vendor tree is considered fresh
+//! `BuildModel::external_deps`, the vendor tree is considered fresh
 //! and the synthetic `CrateDef`s in the lock are auto-registered into
 //! the model. A mismatch forces the user to re-run `gluon vendor`.
 //!

@@ -135,11 +135,11 @@ pub fn run(
             profile.name
         ))
     })?;
-    let suffix = crate::compile::compile_crate::exe_suffix_for_target(&target.spec);
+    let suffix = crate::compile::compile_utils::exe_suffix_for_target(&target.spec);
     let kernel: PathBuf = ctx
         .layout
         .cross_final_dir(target, profile)
-        .join(format!("{}{suffix}", crate::compile::compile_crate::normalize_crate_name(&krate.name)));
+        .join(format!("{}{suffix}", crate::compile::compile_utils::normalize_crate_name(&krate.name)));
 
     // Step 3: resolve QEMU config.
     //

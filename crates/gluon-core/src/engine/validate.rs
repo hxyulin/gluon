@@ -7,7 +7,7 @@
 //! resolution (profile inheritance merging, config selects, etc.) belongs in
 //! the forthcoming `config::resolve` pass.
 
-use crate::compile::compile_crate::normalize_crate_name;
+use crate::compile::compile_utils::normalize_crate_name;
 use crate::error::Diagnostic;
 use gluon_model::{BuildModel, Handle, ProfileDef};
 use std::collections::{BTreeMap, BTreeSet};
@@ -125,7 +125,7 @@ fn check_profile_inheritance_cycles(model: &BuildModel, diags: &mut Vec<Diagnost
 ///
 /// The arena already rejects two crates with the *exact* same name, but
 /// the compile layer normalizes `-` → `_` before handing the name to
-/// rustc (see [`crate::compile::compile_crate::normalize_crate_name`]).
+/// rustc (see [`crate::compile::compile_utils::normalize_crate_name`]).
 /// So `foo-bar` and `foo_bar` are distinct in the arena but indistinguishable
 /// to rustc — they would clobber each other's `.rlib` on disk and produce
 /// confusing "duplicate crate" errors at link time. We catch the collision

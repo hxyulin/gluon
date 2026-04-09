@@ -75,6 +75,19 @@ impl<'a> PipelineDispatcher<'a> {
     }
 }
 
+/// Lock a mutex, converting a poisoned-lock panic into a gluon [`Error`].
+///
+/// The scheduler shares several `Mutex`-guarded maps across worker
+/// threads. If any thread panics while holding a lock the mutex is
+/// poisoned and all subsequent `lock()` calls would panic. This helper
+/// converts that into a recoverable `Error::Config` so the build fails
+/// with a diagnostic instead of an abort.
+fn lock_or_poison<'a, T>(mutex: &'a std::sync::Mutex<T>, name: &str) -> Result<std::sync::MutexGuard<'a, T>> {
+    mutex
+        .lock()
+        .map_err(|_| Error::Config(format!("scheduler: {name} mutex poisoned")))
+}
+
 impl<'a> JobDispatcher for PipelineDispatcher<'a> {
     fn dispatch(&self, node: NodeId, stdout: &mut Vec<u8>, stderr: &mut Vec<u8>) -> Result<()> {
         let node_kind = self.dag.nodes[node as usize];
@@ -86,9 +99,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                 let (path, was_cached) = helpers::sysroot::ensure_sysroot_for_node(
                     self.ctx, self.model, target, stdout,
                 )?;
-                self.sysroots
-                    .lock()
-                    .map_err(|_| Error::Config("scheduler: sysroots mutex poisoned".into()))?
+                lock_or_poison(self.sysroots, "sysroots")?
                     .insert(target, path);
                 self.record(was_cached);
                 Ok(())
@@ -102,10 +113,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                 // The DAG wires ConfigCrate(target) → Sysroot(target) so
                 // this lookup must always succeed.
                 let sysroot_dir = {
-                    let map = self
-                        .sysroots
-                        .lock()
-                        .map_err(|_| Error::Config("scheduler: sysroots mutex poisoned".into()))?;
+                    let map = lock_or_poison(self.sysroots, "sysroots")?;
                     map.get(&target)
                         .cloned()
                         .ok_or_else(|| {
@@ -124,9 +132,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                     &sysroot_dir,
                     stdout,
                 )?;
-                self.artifacts
-                    .lock()
-                    .map_err(|_| Error::Config("scheduler: artifacts mutex poisoned".into()))?
+                lock_or_poison(self.artifacts, "artifacts")?
                     .set_config_crate(target, rlib_path);
                 self.record(was_cached);
                 Ok(())
@@ -155,10 +161,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                 let sysroot_dir: Option<PathBuf> = if crate_ref.host {
                     None
                 } else {
-                    let map = self
-                        .sysroots
-                        .lock()
-                        .map_err(|_| Error::Config("scheduler: sysroots mutex poisoned".into()))?;
+                    let map = lock_or_poison(self.sysroots, "sysroots")?;
                     Some(map.get(&crate_ref.target).cloned().ok_or_else(|| {
                         Error::Compile(format!(
                             "scheduler: Crate({:?}) ran before its Sysroot({:?}) dependency \
@@ -176,10 +179,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                 // would serialise all parallel compilations on this single
                 // mutex. Cloning a BTreeMap of a few dozen entries is cheap
                 // compared to a rustc invocation.
-                let artifacts_snapshot = self
-                    .artifacts
-                    .lock()
-                    .map_err(|_| Error::Config("scheduler: artifacts mutex poisoned".into()))?
+                let artifacts_snapshot = lock_or_poison(self.artifacts, "artifacts")?
                     .clone();
 
                 let (out_path, was_cached) = compile_crate(
@@ -193,9 +193,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                     },
                 )?;
 
-                self.artifacts
-                    .lock()
-                    .map_err(|_| Error::Config("scheduler: artifacts mutex poisoned".into()))?
+                lock_or_poison(self.artifacts, "artifacts")?
                     .insert(crate_handle, out_path);
                 self.record(was_cached);
                 let _ = stdout;
@@ -212,10 +210,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                 // source-crate handles to their artifact paths without
                 // holding the lock across the filesystem copy. Pattern
                 // mirrors the `Crate` arm above.
-                let artifacts_snapshot = self
-                    .artifacts
-                    .lock()
-                    .map_err(|_| Error::Config("scheduler: artifacts mutex poisoned".into()))?
+                let artifacts_snapshot = lock_or_poison(self.artifacts, "artifacts")?
                     .clone();
                 let (path, was_cached) = helpers::esp::ensure_esp(
                     self.ctx,
@@ -225,9 +220,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                     &artifacts_snapshot,
                     stdout,
                 )?;
-                self.esps
-                    .lock()
-                    .map_err(|_| Error::Config("scheduler: esps mutex poisoned".into()))?
+                lock_or_poison(self.esps, "esps")?
                     .insert(esp_handle, path);
                 self.record(was_cached);
                 let _ = stderr;

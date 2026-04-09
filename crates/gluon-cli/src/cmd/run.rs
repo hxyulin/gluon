@@ -1,6 +1,6 @@
 //! `gluon run` subcommand — builds the project and launches QEMU.
 //!
-//! See [`gluon_core::run`] for the actual pipeline; this module is a
+//! See [`mod@gluon_core::run`] for the actual pipeline; this module is a
 //! thin adapter between [`crate::cli::RunArgs`] and
 //! [`gluon_core::RunOptions`].
 

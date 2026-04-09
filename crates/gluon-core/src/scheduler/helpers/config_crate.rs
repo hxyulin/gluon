@@ -20,7 +20,7 @@
 //! of `generated/<project>_config/`. Downstream cross crates consume the
 //! config crate for their own target via `--extern`.
 
-use crate::compile::compile_crate::sanitise_crate_name;
+use crate::compile::compile_utils::sanitise_crate_name;
 use crate::compile::{CompileCtx, Emit, RustcCommandBuilder};
 use crate::error::{Diagnostic, Error, Result};
 use gluon_model::{BuildModel, CrateType, Handle, ResolvedConfig, ResolvedValue, TargetDef};

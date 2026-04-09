@@ -94,7 +94,7 @@ pub struct BuildSummary {
     /// Number of cacheable steps that were already fresh in the cache and
     /// therefore skipped rustc entirely.
     pub cached: usize,
-    /// Assembled-ESP directories keyed by [`EspDef`] handle.
+    /// Assembled-ESP directories keyed by [`gluon_model::EspDef`] handle.
     pub esp_dirs: std::collections::BTreeMap<gluon_model::Handle<gluon_model::EspDef>, std::path::PathBuf>,
 }
 

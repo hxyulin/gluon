@@ -14,6 +14,7 @@
 //! - [`CompileCtx`] — the triple of layout + rustc info + cache that every
 //!   compile step (sysroot, host crates, cross crates) threads through.
 
+pub mod command_builder;
 pub mod compile_and_cache;
 pub mod compile_crate;
 pub mod driver;
@@ -21,6 +22,7 @@ pub mod extern_map;
 pub mod layout;
 pub mod rustc;
 pub mod rustc_info;
+pub mod compile_utils;
 
 pub use driver::DriverKind;
 

@@ -99,7 +99,7 @@ pub struct OvmfResolveCtx<'a> {
 }
 
 impl<'a> OvmfResolveCtx<'a> {
-    /// Production context: real env, hard-coded [`SYSTEM_PATHS`].
+    /// Production context: real env, hard-coded `SYSTEM_PATHS`.
     pub fn from_env(build_root: &'a Path, profile_name: &'a str) -> Self {
         Self {
             build_root,
