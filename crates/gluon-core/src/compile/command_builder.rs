@@ -1,6 +1,6 @@
 //! Rustc command assembly for per-crate compilation.
 //!
-//! This module contains `build_rustc_command`, which assembles a
+//! This module contains [`build_rustc_command`], which assembles a
 //! [`RustcCommandBuilder`] for a single user crate without spawning rustc.
 //! It was extracted from `compile_crate.rs` to keep that module focused on
 //! cache integration and process management.
