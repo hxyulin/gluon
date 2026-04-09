@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gluon-core", "crates/gluon-cli"]
+members = ["crates/gluon-model", "crates/gluon-core", "crates/gluon-cli"]
 default-members = ["crates/gluon-cli"]
 
 [workspace.package]
@@ -11,4 +11,5 @@ repository = "https://github.com/hxyulin/gluon"
 rust-version = "1.85"
 
 [workspace.dependencies]
+gluon-model = { path = "crates/gluon-model" }
 gluon-core = { path = "crates/gluon-core" }

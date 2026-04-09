@@ -8,3 +8,5 @@ rust-version.workspace = true
 description = "Core library for the Gluon build system: build model, scheduler, compile/cache/vendor primitives."
 
 [dependencies]
+gluon-model.workspace = true
+thiserror = "1"
