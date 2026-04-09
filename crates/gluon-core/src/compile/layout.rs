@@ -169,6 +169,31 @@ impl BuildLayout {
             .join("final")
     }
 
+    /// ESP assembly output directory for a named `EspDef` under the
+    /// profile's cross target.
+    ///
+    /// `gluon build`: `<root>/cross/<target>/<profile>/esp/<name>/`.
+    ///
+    /// The ESP directory is populated by the `EspBuild` scheduler node
+    /// from the primary outputs of the named source crates. Keying by
+    /// the profile's cross target (not the source crates' individual
+    /// targets — they may differ, as in the bootloader-with-embedded-kernel
+    /// case) keeps the output path stable regardless of which crate
+    /// targets the user wires into the ESP entries.
+    pub fn esp_dir(
+        &self,
+        target: &TargetDef,
+        profile: &ResolvedProfile,
+        esp_name: &str,
+    ) -> PathBuf {
+        self.user_crate_root()
+            .join("cross")
+            .join(&target.name)
+            .join(&profile.name)
+            .join("esp")
+            .join(esp_name)
+    }
+
     /// Directory containing the generated config crate
     /// (`<root>/generated/<project>_config/`).
     ///

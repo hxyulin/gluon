@@ -54,6 +54,44 @@ pub struct CompileCrateInput<'a> {
     pub sysroot_dir: Option<&'a Path>,
 }
 
+/// Walk a crate's `artifact_env` and return the list of referenced
+/// artifact output paths. Used by [`compile`] to seed the cache
+/// freshness query with artifact-dep mtimes, so that a kernel rebuild
+/// (which updates the kernel binary's mtime but may leave its output
+/// *path* unchanged — cross Bin crates have no extra-filename hash)
+/// invalidates the consuming bootloader's cache.
+///
+/// Returns an empty vec for crates that don't use `artifact_env`.
+///
+/// Callers must have already built every referenced artifact; the
+/// DAG edge from `artifact_deps` guarantees this at scheduler time.
+/// Missing artifacts here are a scheduler bug.
+pub(crate) fn collect_artifact_env_sources(
+    crate_def: &CrateDef,
+    model: &BuildModel,
+    artifacts: &ArtifactMap,
+) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::with_capacity(crate_def.artifact_env.len());
+    for (env_key, dep_name) in &crate_def.artifact_env {
+        let dep_handle = model.crates.lookup(dep_name).ok_or_else(|| {
+            Error::Compile(format!(
+                "crate '{}' has artifact_env entry '{}={}', but no crate named '{}' \
+                 exists in the build model",
+                crate_def.name, env_key, dep_name, dep_name,
+            ))
+        })?;
+        let artifact_path = artifacts.get(dep_handle).ok_or_else(|| {
+            Error::Compile(format!(
+                "crate '{}' artifact_env references '{}' but its artifact is not \
+                 available in ArtifactMap (scheduler bug)",
+                crate_def.name, dep_name,
+            ))
+        })?;
+        out.push(artifact_path.to_path_buf());
+    }
+    Ok(out)
+}
+
 /// Assemble a [`RustcCommandBuilder`] for the given crate without spawning
 /// rustc. Also returns the expected output artifact path and the depfile
 /// path.
@@ -178,11 +216,14 @@ pub(crate) fn build_rustc_command(
                 // The artifact_dir (cross_artifact_dir) is kept for incremental
                 // state; out_dir points to final_dir so the binary lands there.
                 let final_dir = layout.cross_final_dir(target, &resolved.profile);
-                // For binaries, rustc writes the file at exactly
-                // `<--crate-name>` (no `lib` prefix, no extension on
-                // unix). We must therefore look for the *normalized* name
-                // on disk, not the user-typed dashed name.
-                let artifact = final_dir.join(crate_name_rustc.as_ref());
+                // For binaries, rustc writes the file at
+                // `<--crate-name><exe-suffix>` where exe-suffix is
+                // target-specific (empty for bare-metal, `.efi` for UEFI,
+                // `.exe` for Windows). We must use the *normalized* name
+                // and the correct suffix so the artifact path matches
+                // what rustc actually writes on disk.
+                let suffix = exe_suffix_for_target(&target.spec);
+                let artifact = final_dir.join(format!("{}{suffix}", crate_name_rustc));
                 // Depfile: without extra-filename, rustc writes `<name>.d`
                 // in the --out-dir (final_dir).
                 let depfile = final_dir.join(format!("{crate_name_rustc}.d"));
@@ -259,9 +300,17 @@ pub(crate) fn build_rustc_command(
             )
             .extern_crate("alloc", &sysroot_lib.join("liballoc-gluon-alloc.rlib"));
 
-        // Inject the generated config crate if it is available. This is
-        // populated by chunk B4 after the config crate is compiled.
-        if let Some(config_path) = artifacts.config_crate() {
+        // Inject the generated config crate if it is available AND this
+        // crate targets the same triple as the profile. The config crate
+        // is compiled once for the profile's cross target; injecting it
+        // into crates compiled for a different target would produce a
+        // target-mismatch error from rustc. Crates on other targets
+        // simply don't see the config constants — for the bootloader-
+        // with-embedded-kernel scenario, only the bootloader (on the
+        // profile target) uses config; the kernel is standalone.
+        if crate_ref.target == resolved.profile.target
+            && let Some(config_path) = artifacts.config_crate()
+        {
             // The config crate name is `<project>_config` by default, or the
             // override in `ProjectDef::config_crate_name`. We sanitise the
             // project name (lowercase, non-[a-z0-9_] replaced by `_`) and
@@ -325,6 +374,42 @@ pub(crate) fn build_rustc_command(
             ))
         })?;
         builder.extern_crate(extern_name, artifact_path);
+    }
+
+    // Artifact env vars (BTreeMap iteration = deterministic order, so the
+    // cache-key hash is stable across runs). Each entry names a sibling
+    // crate whose absolute, canonicalised output path gets injected as
+    // an env var at rustc spawn time. The calling source can then use
+    // `env!("KEY")` at compile time — e.g. `include_bytes!(env!("KERNEL_PATH"))`.
+    //
+    // This function relies on the scheduler having built the referenced
+    // crate already; the DAG edge comes from `CrateDef::artifact_deps`,
+    // which the Rhai builder auto-populates alongside `artifact_env`.
+    // Missing artifacts here are a scheduler bug (same error shape as
+    // the `--extern` loop above).
+    for (env_key, dep_name) in &crate_def.artifact_env {
+        let dep_handle = model.crates.lookup(dep_name).ok_or_else(|| {
+            Error::Compile(format!(
+                "crate '{}' has artifact_env entry '{}={}', but no crate named '{}' \
+                 exists in the build model (validate pass should have caught this)",
+                crate_name, env_key, dep_name, dep_name,
+            ))
+        })?;
+        let artifact_path = artifacts.get(dep_handle).ok_or_else(|| {
+            Error::Compile(format!(
+                "crate '{}' artifact_env references '{}' but its artifact is not \
+                 available in ArtifactMap (scheduler bug — artifact_deps ordering \
+                 edge should have built it first)",
+                crate_name, dep_name,
+            ))
+        })?;
+        // Canonicalise so `env!` receives a stable absolute path regardless
+        // of where the build was invoked from. Fall back to the original
+        // path if canonicalisation fails — e.g. inside tests that don't
+        // actually write the artifact to disk.
+        let abs_path = std::fs::canonicalize(artifact_path)
+            .unwrap_or_else(|_| artifact_path.to_path_buf());
+        builder.env(env_key.as_str(), abs_path.as_os_str());
     }
 
     // Profile-driven code-generation knobs.
@@ -530,6 +615,13 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<(PathBu
     };
     let depfile_for_diag = depfile_path.clone();
 
+    // Collect the artifact_env source paths now — once — so they feed
+    // both the freshness query (via sources_for_query) and the cache
+    // record (via parse_depfile + extend). The build_rustc_command
+    // walk above injected them as env vars; here we redo the same walk
+    // to get the path list for cache plumbing.
+    let extra_sources = collect_artifact_env_sources(crate_def, model, input.artifacts)?;
+
     crate::compile::run_compile_and_cache(
         ctx,
         builder,
@@ -538,6 +630,7 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<(PathBu
         output_path,
         depfile_path,
         Some(&out_dir),
+        extra_sources,
         Box::new(move |output, rendered| {
             let headline = if is_host {
                 format!(
@@ -602,6 +695,36 @@ pub(crate) fn normalize_crate_name(name: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(name)
     }
+}
+
+/// Derive the executable suffix for a given target spec.
+///
+/// rustc appends a platform-specific suffix to `--crate-type bin` outputs
+/// depending on the target triple. For most bare-metal targets the suffix
+/// is empty; for UEFI targets it is `.efi`; for Windows targets it is
+/// `.exe`. This function matches on well-known triple suffixes so gluon
+/// can predict the on-disk filename without spawning `rustc --print
+/// file-names` (which would add a per-target rustc invocation).
+///
+/// The match is intentionally conservative: unknown targets get no suffix
+/// (the common case for bare-metal). If a custom target spec has an unusual
+/// suffix, the user can work around this by adding `-o <name>` to
+/// `rustc_flags` in their `gluon.rhai`.
+pub(crate) fn exe_suffix_for_target(spec: &str) -> &'static str {
+    // UEFI targets produce PE32+ with .efi extension.
+    if spec.ends_with("-uefi") || spec.contains("-uefi-") {
+        return ".efi";
+    }
+    // Windows targets produce PE with .exe extension.
+    if spec.contains("-windows-") || spec.ends_with("-windows") {
+        return ".exe";
+    }
+    // WebAssembly targets produce .wasm files when compiled as bin.
+    if spec.starts_with("wasm32-") || spec.starts_with("wasm64-") {
+        return ".wasm";
+    }
+    // Everything else (Linux, macOS, bare-metal, custom specs) — no suffix.
+    ""
 }
 
 /// Sanitise an arbitrary string to a valid Rust identifier component.
@@ -1081,6 +1204,141 @@ mod tests {
             extern_val,
             Some("myutil=/build/libmyutil-gluon-myutil.rlib"),
             "--extern myutil=... must be present, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn flag_assembly_injects_artifact_env_var() {
+        // A consumer crate with `artifact_env = { KERNEL_PATH: "kernel" }`
+        // must receive KERNEL_PATH=<kernel artifact path> in the rustc
+        // command builder's env map. The referenced kernel crate's
+        // output lives in the ArtifactMap.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = make_ctx(tmp.path(), "/usr/bin/rustc");
+
+        let mut model = BuildModel::default();
+        let th = insert_target(&mut model, make_target("x86", "x86_64-unknown-none", true));
+
+        // Kernel crate (the artifact-dep target).
+        let kernel_h = insert_crate(
+            &mut model,
+            CrateDef {
+                name: "kernel".into(),
+                path: "crates/kernel".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Bin,
+                ..Default::default()
+            },
+        );
+
+        // Bootloader crate with an artifact_env entry and a matching
+        // artifact_deps ordering edge. Note: no regular `deps` entry —
+        // this is pure artifact-level coupling, not a compile-time link.
+        let mut artifact_env = std::collections::BTreeMap::new();
+        artifact_env.insert("KERNEL_PATH".to_string(), "kernel".to_string());
+        let bootloader_h = insert_crate(
+            &mut model,
+            CrateDef {
+                name: "bootloader".into(),
+                path: "crates/bootloader".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Bin,
+                artifact_deps: vec!["kernel".into()],
+                artifact_env,
+                ..Default::default()
+            },
+        );
+
+        let resolved = make_resolved(th, tmp.path().to_path_buf());
+        let crate_ref = host_ref(bootloader_h, th);
+
+        // The kernel's "artifact" — an arbitrary path. It does not have
+        // to exist on disk for build_rustc_command; canonicalize falls
+        // back to the original path when it can't resolve it.
+        let kernel_out = PathBuf::from("/build/cross/x86/dev/final/kernel");
+        let mut artifacts = ArtifactMap::new();
+        artifacts.insert(kernel_h, kernel_out.clone());
+
+        let (builder, _, _) = build_rustc_command(
+            &ctx,
+            &CompileCrateInput {
+                model: &model,
+                resolved: &resolved,
+                crate_ref: &crate_ref,
+                artifacts: &artifacts,
+                sysroot_dir: None,
+            },
+        )
+        .unwrap();
+
+        let envs = builder.envs();
+        let kernel_env = envs
+            .get(std::ffi::OsStr::new("KERNEL_PATH"))
+            .expect("KERNEL_PATH must be injected");
+        // canonicalize on /build/... will fall back to the literal.
+        assert_eq!(
+            kernel_env, kernel_out.as_os_str(),
+            "KERNEL_PATH must carry the kernel artifact path"
+        );
+    }
+
+    #[test]
+    fn artifact_env_missing_artifact_returns_compile_error() {
+        // If the referenced crate has no entry in ArtifactMap (scheduler
+        // bug: artifact_deps edge was missing or the kernel hasn't built
+        // yet), build_rustc_command must surface a clear error instead
+        // of silently injecting garbage.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = make_ctx(tmp.path(), "/usr/bin/rustc");
+
+        let mut model = BuildModel::default();
+        let th = insert_target(&mut model, make_target("x86", "x86_64-unknown-none", true));
+        let _kernel_h = insert_crate(
+            &mut model,
+            CrateDef {
+                name: "kernel".into(),
+                crate_type: CrateType::Bin,
+                ..Default::default()
+            },
+        );
+        let mut artifact_env = std::collections::BTreeMap::new();
+        artifact_env.insert("KERNEL_PATH".to_string(), "kernel".to_string());
+        let bootloader_h = insert_crate(
+            &mut model,
+            CrateDef {
+                name: "bootloader".into(),
+                path: "crates/bootloader".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Bin,
+                artifact_deps: vec!["kernel".into()],
+                artifact_env,
+                ..Default::default()
+            },
+        );
+
+        let resolved = make_resolved(th, tmp.path().to_path_buf());
+        let crate_ref = host_ref(bootloader_h, th);
+        let artifacts = ArtifactMap::new(); // empty — kernel not built
+
+        let result = build_rustc_command(
+            &ctx,
+            &CompileCrateInput {
+                model: &model,
+                resolved: &resolved,
+                crate_ref: &crate_ref,
+                artifacts: &artifacts,
+                sysroot_dir: None,
+            },
+        );
+
+        let err = match result {
+            Ok(_) => panic!("expected error when artifact_env target missing from ArtifactMap"),
+            Err(e) => e,
+        };
+        let err_msg = format!("{err:?}");
+        assert!(
+            err_msg.contains("artifact_env"),
+            "error must mention artifact_env: {err_msg}"
         );
     }
 

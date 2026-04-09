@@ -295,8 +295,17 @@ pub fn resolve(
         resolved_options.insert(k, v);
     }
 
-    // 10. Resolve crate list. Include every crate in every group whose
-    //     target matches the effective target OR whose target is "host".
+    // 10. Resolve crate list. Include EVERY crate in the model, not just
+    //     those matching the profile's target. Multi-target projects (e.g.
+    //     a `x86_64-unknown-uefi` bootloader embedding a
+    //     `x86_64-unknown-none` kernel) need all declared crates compiled
+    //     — the DAG's `artifact_deps` edges enforce the correct ordering
+    //     across targets, and each crate gets its own sysroot node for
+    //     its specific target.
+    //
+    //     Host crates (target == "host") set `host: true` so the
+    //     scheduler compiles them for the build machine. All other crates
+    //     are cross and receive their group's resolved target handle.
     let mut resolved_crates: Vec<ResolvedCrateRef> = Vec::new();
     for (crate_handle, krate) in model.crates.iter() {
         let Some(group_h) = krate.group_handle else {
@@ -306,13 +315,6 @@ pub fn resolve(
             continue;
         };
         let is_host = group.target == "host";
-        let matches_target = group
-            .target_handle
-            .map(|h| h == effective_target)
-            .unwrap_or(false);
-        if !is_host && !matches_target {
-            continue;
-        }
         // For host crates, the target field is just a placeholder — the
         // scheduler keys off `host: bool`. We use `effective_target` as a
         // safe placeholder so the field is always populated with a valid

@@ -29,7 +29,7 @@
 //! **Do not change `edges_out` to `Vec` under any circumstances.**
 
 use crate::error::{Error, Result};
-use gluon_model::{BuildModel, CrateDef, Handle, ResolvedConfig, RuleDef, TargetDef};
+use gluon_model::{BuildModel, CrateDef, EspDef, Handle, ResolvedConfig, RuleDef, TargetDef};
 use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
@@ -52,6 +52,10 @@ pub enum DagNode {
     Crate(Handle<CrateDef>),
     /// Run a user-declared rule via the rule registry.
     Rule(Handle<RuleDef>),
+    /// Assemble an EFI System Partition directory from the primary build
+    /// outputs of one or more sibling crates. Depends on every source
+    /// crate referenced by the ESP's entries. See [`EspDef`].
+    Esp(Handle<EspDef>),
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +199,18 @@ impl Default for Dag {
 ///    Both host→host and cross→cross (and host→cross for proc-macros) are
 ///    modelled here; cross→host is architecturally nonsensical but not
 ///    explicitly rejected.
+/// 4a. **Crate → Crate (artifact_deps)**: Every crate depends on every entry
+///     in its `CrateDef::artifact_deps` list that resolves to a crate present
+///     in `resolved.crates`. Unlike regular `deps`, artifact deps do not
+///     produce `--extern` flags — they exist purely to enforce build ordering
+///     across crates that reference each other's build outputs (e.g. a
+///     bootloader that `include_bytes!`es a kernel ELF via an `artifact_env`
+///     injected `KERNEL_PATH`). Edges are group- and target-agnostic; a
+///     `x86_64-unknown-uefi` bootloader can artifact-depend on a
+///     `x86_64-unknown-none` kernel and the cross-group edge is added here.
+///     Dangling names (no matching crate in the model) are a resolver-level
+///     error surfaced by `validate::check_artifact_deps_resolve`; this
+///     function silently skips them as a belt-and-braces backstop.
 /// 5. **Pipeline stage barrier**: Each stage in each pipeline becomes one or
 ///    more rule nodes. Every node in stage N depends on every node in
 ///    stage N−1 (bipartite barrier). In MVP-M each stage has at most one rule
@@ -217,17 +233,30 @@ pub fn build_dag(resolved: &ResolvedConfig, model: &BuildModel) -> Result<Dag> {
     let mut dag = Dag::new();
 
     // -----------------------------------------------------------------------
-    // Step 1: Insert the cross Sysroot node.
+    // Step 1: Insert cross Sysroot nodes for every target in use.
     // -----------------------------------------------------------------------
-    // The profile's target is the canonical cross target for this build.
-    let sysroot_id = dag.insert_node(DagNode::Sysroot(resolved.profile.target));
+    // Each distinct target used by at least one resolved cross crate gets
+    // its own Sysroot node. A project with two targets (e.g. x86_64-unknown-uefi
+    // for the bootloader and x86_64-unknown-none for the kernel) produces
+    // two independent sysroot builds. `insert_node` is idempotent so
+    // inserting the same target twice is a no-op.
+    //
+    // The profile's target always gets a sysroot node (for the config crate);
+    // additional targets appear if any resolved crate references them.
+    let profile_sysroot_id = dag.insert_node(DagNode::Sysroot(resolved.profile.target));
+    for crate_ref in &resolved.crates {
+        if !crate_ref.host {
+            dag.insert_node(DagNode::Sysroot(crate_ref.target));
+        }
+    }
 
     // -----------------------------------------------------------------------
-    // Step 2: Insert the ConfigCrate node and wire it to the sysroot.
-    // Edge rule 3: ConfigCrate depends on the cross target's sysroot.
+    // Step 2: Insert the ConfigCrate node and wire it to the profile sysroot.
+    // Edge rule 3: ConfigCrate depends on the profile target's sysroot
+    // (it's compiled for that target).
     // -----------------------------------------------------------------------
     let config_id = dag.insert_node(DagNode::ConfigCrate);
-    dag.add_edge(sysroot_id, config_id);
+    dag.add_edge(profile_sysroot_id, config_id);
 
     // -----------------------------------------------------------------------
     // Step 3: Insert every crate in resolved.crates.
@@ -244,10 +273,19 @@ pub fn build_dag(resolved: &ResolvedConfig, model: &BuildModel) -> Result<Dag> {
         // Host crates (proc-macros, build scripts) are compiled for the build
         // machine and do not use the custom sysroot or config crate.
         if !crate_ref.host {
-            // Rule 1: cross crate → sysroot.
-            dag.add_edge(sysroot_id, crate_id);
-            // Rule 2: cross crate → config crate.
-            dag.add_edge(config_id, crate_id);
+            // Rule 1: cross crate → sysroot FOR ITS OWN TARGET (not
+            // necessarily the profile target — multi-target projects have
+            // independent sysroots per target).
+            let crate_sysroot_id = dag.insert_node(DagNode::Sysroot(crate_ref.target));
+            dag.add_edge(crate_sysroot_id, crate_id);
+            // Rule 2: cross crate → config crate ONLY when the crate
+            // targets the same triple as the profile. The config crate
+            // is compiled once for the profile's cross target; injecting
+            // it into crates on a different target would cause a target
+            // mismatch error from rustc.
+            if crate_ref.target == resolved.profile.target {
+                dag.add_edge(config_id, crate_id);
+            }
         }
 
         // Edge rule 4: crate → its dependency crates.
@@ -271,6 +309,48 @@ pub fn build_dag(resolved: &ResolvedConfig, model: &BuildModel) -> Result<Dag> {
             let dep_id = dag.insert_node(DagNode::Crate(dep_handle));
             // The dep must complete before this crate can compile.
             dag.add_edge(dep_id, crate_id);
+        }
+
+        // Edge rule 4a: crate → its artifact-dep crates (ordering-only,
+        // no --extern). Unknown names are skipped silently; validate.rs
+        // is responsible for surfacing them as a diagnostic before we
+        // get here.
+        for dep_name in &crate_def.artifact_deps {
+            let dep_handle = match model.crates.lookup(dep_name) {
+                Some(h) => h,
+                None => continue, // dangling — validate surfaces this
+            };
+            if !resolved_handles.contains(&dep_handle) {
+                continue;
+            }
+            let dep_id = dag.insert_node(DagNode::Crate(dep_handle));
+            dag.add_edge(dep_id, crate_id);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 3b: EspBuild nodes.
+    // -----------------------------------------------------------------------
+    // Each declared ESP becomes one node. The node depends on every source
+    // crate referenced by its entries. Entries whose source crate does not
+    // resolve (missing `source_crate_handle` because intern failed) are
+    // skipped — validate has already pushed a diagnostic for those.
+    // Entries whose source crate exists but is not in `resolved.crates`
+    // (e.g. gated behind a disabled config option) are also skipped, same
+    // policy as regular deps. An ESP with zero resolvable entries still
+    // gets a node — the helper will produce an empty directory, which
+    // is harmless and makes the failure mode observable.
+    for (esp_handle, esp) in model.esps.iter() {
+        let esp_id = dag.insert_node(DagNode::Esp(esp_handle));
+        for entry in &esp.entries {
+            let Some(src_handle) = entry.source_crate_handle else {
+                continue; // intern-time dangling ref — diagnostic already pushed
+            };
+            if !resolved_handles.contains(&src_handle) {
+                continue;
+            }
+            let src_id = dag.insert_node(DagNode::Crate(src_handle));
+            dag.add_edge(src_id, esp_id);
         }
     }
 
@@ -1002,5 +1082,223 @@ mod tests {
 
         // In-degree of rule: both crates feed into it (plus 0 from stage barrier).
         assert_eq!(*dag.in_degree.get(&rule_id).unwrap(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 10: artifact_dep_across_groups_and_targets
+    // -----------------------------------------------------------------------
+    //
+    // A bootloader crate (x86_64-unknown-uefi, "uefi-group") has an
+    // `artifact_deps` entry pointing at a kernel crate (x86_64-unknown-none,
+    // "kernel-group"). The DAG builder must emit a cross-group, cross-target
+    // ordering edge from kernel → bootloader even though the two crates
+    // share no regular `deps` relationship.
+    //
+    // This is the load-bearing case for `gluon run`-time artifact embedding
+    // (a bootloader that `include_bytes!`es a kernel via a `KERNEL_PATH`
+    // env var injected at rustc invocation time). If the edge is missing,
+    // the scheduler may run the bootloader node before the kernel is built,
+    // and `include_bytes!` will either fail or silently embed stale bytes.
+    #[test]
+    fn artifact_dep_across_groups_and_targets() {
+        let mut model = BuildModel::default();
+        let kernel_target = make_target(&mut model, "x86_64-kernel");
+        let uefi_target = make_target(&mut model, "x86_64-uefi");
+
+        // Kernel crate in kernel-group / x86_64-kernel target.
+        let (kernel_h, _) = model.crates.insert(
+            "kernel".into(),
+            CrateDef {
+                name: "kernel".into(),
+                path: "crates/kernel".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Bin,
+                target: "cross".into(),
+                target_handle: Some(kernel_target),
+                group: "kernel-group".into(),
+                ..Default::default()
+            },
+        );
+
+        // Bootloader crate in uefi-group / x86_64-uefi target, with an
+        // artifact_dep on the kernel (no regular `deps` entry).
+        let (bootloader_h, _) = model.crates.insert(
+            "bootloader".into(),
+            CrateDef {
+                name: "bootloader".into(),
+                path: "crates/bootloader".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Bin,
+                target: "cross".into(),
+                target_handle: Some(uefi_target),
+                group: "uefi-group".into(),
+                artifact_deps: vec!["kernel".into()],
+                ..Default::default()
+            },
+        );
+
+        // Resolved config pins the profile to the uefi target (the
+        // "running" target) but still lists both crates — the scheduler
+        // builds both regardless of which target the profile points at.
+        let resolved = make_resolved(
+            uefi_target,
+            vec![
+                ResolvedCrateRef {
+                    handle: kernel_h,
+                    target: kernel_target,
+                    host: false,
+                },
+                ResolvedCrateRef {
+                    handle: bootloader_h,
+                    target: uefi_target,
+                    host: false,
+                },
+            ],
+        );
+
+        let dag = build_dag(&resolved, &model).unwrap();
+
+        let kernel_id = *dag
+            .node_index
+            .get(&DagNode::Crate(kernel_h))
+            .expect("kernel node present");
+        let bootloader_id = *dag
+            .node_index
+            .get(&DagNode::Crate(bootloader_h))
+            .expect("bootloader node present");
+
+        // The critical assertion: kernel → bootloader edge exists.
+        let kernel_outs = dag
+            .edges_out
+            .get(&kernel_id)
+            .expect("kernel has outgoing edges (at least to bootloader)");
+        assert!(
+            kernel_outs.contains(&bootloader_id),
+            "artifact_deps must produce an ordering edge: kernel → bootloader"
+        );
+
+        // Bootloader's in-degree accounts for: Sysroot + ConfigCrate + kernel = 3.
+        assert_eq!(
+            *dag.in_degree.get(&bootloader_id).unwrap(),
+            3,
+            "bootloader in-degree must include the artifact-dep edge from kernel"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: build_dag_inserts_esp_nodes_with_source_crate_edges
+    // -----------------------------------------------------------------------
+    //
+    // A single EspDef with one entry (source_crate = "bootloader") must
+    // produce a `DagNode::Esp` node with an incoming edge from the
+    // bootloader crate's `DagNode::Crate` node. The esp's `entries`
+    // must have been interned with a `source_crate_handle` before
+    // `build_dag` runs — we simulate that by setting it explicitly.
+    #[test]
+    fn build_dag_inserts_esp_nodes_with_source_crate_edges() {
+        use gluon_model::{EspDef, EspEntry};
+
+        let mut model = BuildModel::default();
+        let th = make_target(&mut model, "x86_64-uefi");
+
+        let (bl_h, _) = model.crates.insert(
+            "bootloader".into(),
+            CrateDef {
+                name: "bootloader".into(),
+                path: "crates/bootloader".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Bin,
+                target: "cross".into(),
+                target_handle: Some(th),
+                group: "uefi".into(),
+                ..Default::default()
+            },
+        );
+
+        // Mirror what `intern_esps` would do: resolve the source_crate
+        // name to a handle before calling build_dag.
+        let (esp_h, _) = model.esps.insert(
+            "default".into(),
+            EspDef {
+                name: "default".into(),
+                entries: vec![EspEntry {
+                    source_crate: "bootloader".into(),
+                    source_crate_handle: Some(bl_h),
+                    dest_path: "EFI/BOOT/BOOTX64.EFI".into(),
+                }],
+                span: None,
+            },
+        );
+
+        let resolved = make_resolved(
+            th,
+            vec![ResolvedCrateRef {
+                handle: bl_h,
+                target: th,
+                host: false,
+            }],
+        );
+
+        let dag = build_dag(&resolved, &model).unwrap();
+
+        let bl_id = *dag.node_index.get(&DagNode::Crate(bl_h)).unwrap();
+        let esp_id = *dag
+            .node_index
+            .get(&DagNode::Esp(esp_h))
+            .expect("Esp node must be present");
+
+        // bootloader → esp edge.
+        let bl_outs = dag.edges_out.get(&bl_id).unwrap();
+        assert!(
+            bl_outs.contains(&esp_id),
+            "bootloader → esp edge missing — ESP would run before the bootloader is built"
+        );
+
+        // ESP's in-degree: 1 (the bootloader). Sysroot/ConfigCrate feed
+        // the bootloader, not the ESP directly.
+        assert_eq!(*dag.in_degree.get(&esp_id).unwrap(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 11: artifact_dep_unknown_name_is_silently_skipped
+    // -----------------------------------------------------------------------
+    //
+    // A dangling `artifact_deps` entry (pointing at a crate name that does
+    // not exist in the model) must NOT cause `build_dag` to error. Surfacing
+    // that diagnostic is validate.rs's job — this function's contract is
+    // to build edges for resolvable entries and skip the rest.
+    #[test]
+    fn artifact_dep_unknown_name_is_silently_skipped() {
+        let mut model = BuildModel::default();
+        let th = make_target(&mut model, "x86_64-test");
+        let (consumer_h, _) = model.crates.insert(
+            "consumer".into(),
+            CrateDef {
+                name: "consumer".into(),
+                path: "consumer".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Bin,
+                target: "cross".into(),
+                target_handle: Some(th),
+                group: "default".into(),
+                artifact_deps: vec!["ghost".into()],
+                ..Default::default()
+            },
+        );
+
+        let resolved = make_resolved(
+            th,
+            vec![ResolvedCrateRef {
+                handle: consumer_h,
+                target: th,
+                host: false,
+            }],
+        );
+
+        // Must not return Err.
+        let dag = build_dag(&resolved, &model).expect("unknown artifact_dep must not abort");
+        // Consumer's in-degree: Sysroot + ConfigCrate only (no artifact edge).
+        let consumer_id = *dag.node_index.get(&DagNode::Crate(consumer_h)).unwrap();
+        assert_eq!(*dag.in_degree.get(&consumer_id).unwrap(), 2);
     }
 }

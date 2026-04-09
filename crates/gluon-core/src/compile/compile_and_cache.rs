@@ -71,6 +71,17 @@ pub(crate) type DepfileFailDiag = dyn FnOnce(&crate::error::Error) -> Error;
 /// Run the freshness → rustc → depfile → mark_built sequence for a single
 /// rustc invocation. See the module docs for the full contract.
 ///
+/// `extra_sources` is a list of files that must be considered "inputs"
+/// of this compile even though rustc's depfile won't list them. The
+/// canonical use case is `artifact_env`: a bootloader crate that injects
+/// `KERNEL_PATH=<kernel.efi>` needs the kernel binary's mtime to
+/// participate in freshness checks, so that rebuilding the kernel
+/// invalidates the bootloader's cache. Cross Bin crates have stable
+/// output paths (no extra-filename hash), so the rustc argv hash alone
+/// would miss a kernel content change. Pass an empty slice for callers
+/// with no out-of-band inputs (sysroot, config crate, crates without
+/// `artifact_env`).
+///
 /// Returns `(output_path, was_cached)`:
 /// - `was_cached = true` ⇒ the freshness check short-circuited rustc and
 ///   no new process was spawned.
@@ -84,16 +95,24 @@ pub(crate) fn compile_and_cache(
     output_path: PathBuf,
     depfile_path: PathBuf,
     out_dir_to_create: Option<&Path>,
+    extra_sources: Vec<PathBuf>,
     rustc_fail: Box<RustcFailDiag>,
     depfile_fail: Box<DepfileFailDiag>,
 ) -> Result<(PathBuf, bool)> {
     // Seed the source list from the previous run's depfile if it exists.
     // On a cold build this is empty — the cache entry is also missing,
     // so `is_fresh` returns false regardless.
-    let sources_for_query: Vec<PathBuf> = if depfile_path.exists() {
-        parse_depfile(&depfile_path).unwrap_or_default()
-    } else {
-        Vec::new()
+    //
+    // `extra_sources` is appended unconditionally — these are always
+    // known to the caller and are not tracked by rustc's depfile.
+    let sources_for_query: Vec<PathBuf> = {
+        let mut v = if depfile_path.exists() {
+            parse_depfile(&depfile_path).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        v.extend(extra_sources.iter().cloned());
+        v
     };
 
     // --- Narrow cache-lock acquisition (read) ---
@@ -155,8 +174,17 @@ pub(crate) fn compile_and_cache(
     // the rlib is on disk but the cache stays stale — the next run will
     // miss the cache and re-spawn rustc. That's merely wasteful, not
     // incorrect.
+    //
+    // Append `extra_sources` so they participate in future freshness
+    // checks exactly as they did in this run's query. Without this,
+    // a kernel rebuild would invalidate the bootloader cache on the
+    // first invocation (because the query included the kernel) but be
+    // silently forgotten on the next (because the stored record didn't).
     let sources = match parse_depfile(&depfile_path) {
-        Ok(s) => s,
+        Ok(mut s) => {
+            s.extend(extra_sources.iter().cloned());
+            s
+        }
         Err(e) => return Err(depfile_fail(&e)),
     };
 

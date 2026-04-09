@@ -78,13 +78,24 @@ use std::sync::mpsc;
 /// This exists so that the CLI and integration tests can rely on a single
 /// concrete cache-hit signal rather than scraping per-job stdout — the
 /// alternative we explicitly rejected because it is fragile.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// `esp_dirs` carries the assembled-ESP output paths produced by any
+/// `DagNode::Esp` nodes in this build. It is keyed by
+/// [`gluon_model::Handle<EspDef>`] and consumed by `run::entry` to
+/// auto-wire the ESP into QEMU's `-drive fat:rw:` flag. The map is
+/// empty for builds that do not declare any `esp(...)` blocks.
+///
+/// (`Copy` was dropped when `esp_dirs` was added — call sites clone
+/// explicitly. There are no hot paths relying on a bitwise copy.)
+#[derive(Debug, Clone, Default)]
 pub struct BuildSummary {
     /// Number of cacheable steps that ran rustc to completion this build.
     pub built: usize,
     /// Number of cacheable steps that were already fresh in the cache and
     /// therefore skipped rustc entirely.
     pub cached: usize,
+    /// Assembled-ESP directories keyed by [`EspDef`] handle.
+    pub esp_dirs: std::collections::BTreeMap<gluon_model::Handle<gluon_model::EspDef>, std::path::PathBuf>,
 }
 
 /// Per-node execution closure.

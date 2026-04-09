@@ -772,6 +772,7 @@ pub fn auto_register_vendored_deps(
             rustc_flags: Vec::new(),
             requires_config: Vec::new(),
             artifact_deps: Vec::new(),
+            artifact_env: Default::default(),
             span: None,
         };
         model.crates.insert(pkg.name.clone(), crate_def);

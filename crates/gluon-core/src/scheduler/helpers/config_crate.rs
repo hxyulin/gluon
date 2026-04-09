@@ -297,6 +297,7 @@ pub fn ensure_config_crate(
         output_path,
         depfile_path,
         Some(&out_dir),
+        Vec::new(), // config crate has no out-of-band inputs
         Box::new(move |output, rendered| {
             Error::Diagnostics(vec![
                 Diagnostic::error(format!(

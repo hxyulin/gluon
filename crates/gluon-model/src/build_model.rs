@@ -16,6 +16,13 @@ pub struct BuildModel {
     pub rules: Arena<RuleDef>,
     pub pipelines: Arena<PipelineDef>,
     pub external_deps: Arena<ExternalDepDef>,
+    /// EFI System Partition declarations. Each entry describes a set of
+    /// compiled artifacts to be assembled into a FAT-layout directory
+    /// under `build/cross/<target>/<profile>/esp/<name>/`. Consumed by
+    /// the `EspBuild` scheduler node at build time and auto-wired into
+    /// `gluon run --uefi` when there is exactly one declaration.
+    #[serde(default)]
+    pub esps: Arena<EspDef>,
     /// Keyed by option NAME (e.g. `"CONFIG_FOO"`); options are not in an arena
     /// because every reference to them is by string identifier.
     pub config_options: BTreeMap<String, ConfigOptionDef>,
@@ -202,6 +209,18 @@ pub struct CrateDef {
     /// without `--extern` flags.
     #[serde(default)]
     pub artifact_deps: Vec<String>,
+    /// Environment variables to inject into rustc's process environment
+    /// when compiling this crate. Each value is the *name* of another
+    /// crate whose primary build output path (absolute, canonicalised)
+    /// will be substituted at compile time.
+    ///
+    /// Use case: a bootloader crate declares
+    /// `artifact_env = { "KERNEL_PATH": "kernel" }` and its source does
+    /// `static KERNEL: &[u8] = include_bytes!(env!("KERNEL_PATH"));`
+    /// to embed the kernel binary. The Rhai builder auto-adds the
+    /// referenced crate to `artifact_deps` so the DAG enforces ordering.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifact_env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceSpan>,
 }
@@ -407,6 +426,44 @@ pub enum EspSource {
     Image(PathBuf),
 }
 
+/// EFI System Partition declaration. Describes a set of build artifacts
+/// that should be copied into a FAT-layout directory for UEFI boot.
+///
+/// Unlike `EspSource::Dir`, which points at a user-maintained directory
+/// on disk, an `EspDef` is *generated* by the build pipeline from named
+/// sibling crates. The output directory lives under
+/// `build/cross/<target>/<profile>/esp/<name>/` and is refreshed by the
+/// `EspBuild` scheduler node whenever a source artifact changes.
+///
+/// The typical shape is a single entry for the bootloader:
+/// ```rhai
+/// esp("default").add("bootloader", "EFI/BOOT/BOOTX64.EFI");
+/// ```
+///
+/// `gluon run` auto-picks this ESP when a profile is `boot_mode("uefi")`
+/// and the user has not set an explicit `qemu().esp_dir(...)`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EspDef {
+    pub name: String,
+    /// Ordered list of `(source_crate, dest_path_within_esp)` entries.
+    #[serde(default)]
+    pub entries: Vec<EspEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<SourceSpan>,
+}
+
+/// A single entry in an [`EspDef`]: the name of a sibling crate whose
+/// primary build output should be copied to `dest_path` within the ESP
+/// directory. The `source_crate_handle` field is populated by the intern
+/// pass after the model is fully built.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EspEntry {
+    pub source_crate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_crate_handle: Option<Handle<CrateDef>>,
+    pub dest_path: String,
+}
+
 impl Named for TargetDef {
     fn name(&self) -> &str {
         &self.name
@@ -449,6 +506,12 @@ impl Named for ExternalDepDef {
     }
 }
 
+impl Named for EspDef {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +529,55 @@ mod tests {
         assert!(m.external_deps.is_empty());
         assert!(m.config_options.is_empty());
         assert!(m.presets.is_empty());
+        assert!(m.esps.is_empty());
+    }
+
+    #[test]
+    fn esp_def_round_trips_through_json() {
+        let mut m = BuildModel::default();
+        let (_, inserted) = m.esps.insert(
+            "default".into(),
+            EspDef {
+                name: "default".into(),
+                entries: vec![EspEntry {
+                    source_crate: "bootloader".into(),
+                    source_crate_handle: None,
+                    dest_path: "EFI/BOOT/BOOTX64.EFI".into(),
+                }],
+                span: None,
+            },
+        );
+        assert!(inserted);
+
+        let json = serde_json::to_string(&m).unwrap();
+        let de: BuildModel = serde_json::from_str(&json).unwrap();
+        let h = de.esps.lookup("default").expect("esp name index rebuilt");
+        let esp = de.esps.get(h).unwrap();
+        assert_eq!(esp.entries.len(), 1);
+        assert_eq!(esp.entries[0].source_crate, "bootloader");
+        assert_eq!(esp.entries[0].dest_path, "EFI/BOOT/BOOTX64.EFI");
+    }
+
+    #[test]
+    fn crate_def_artifact_env_round_trips() {
+        let mut c = CrateDef {
+            name: "bootloader".into(),
+            path: "crates/bootloader".into(),
+            edition: "2021".into(),
+            crate_type: CrateType::Bin,
+            ..Default::default()
+        };
+        c.artifact_env
+            .insert("KERNEL_PATH".into(), "kernel".into());
+        c.artifact_deps.push("kernel".into());
+
+        let json = serde_json::to_string(&c).unwrap();
+        let de: CrateDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            de.artifact_env.get("KERNEL_PATH").map(String::as_str),
+            Some("kernel")
+        );
+        assert_eq!(de.artifact_deps, vec!["kernel".to_string()]);
     }
 
     #[test]

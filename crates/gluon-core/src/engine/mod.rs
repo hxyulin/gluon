@@ -887,6 +887,102 @@ mod tests {
     }
 
     #[test]
+    fn esp_builder_inserts_entry_and_intern_resolves_source_crate() {
+        // Declare a bootloader crate, then an esp("default") whose single
+        // entry points at it. After intern, the entry's source_crate_handle
+        // must be populated.
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            let g = group("k").target("x");
+            g.add("bootloader","crates/bootloader").crate_type("bin");
+            esp("default").add("bootloader","EFI/BOOT/BOOTX64.EFI");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let h = model.esps.lookup("default").expect("default esp exists");
+        let esp = model.esps.get(h).unwrap();
+        assert_eq!(esp.entries.len(), 1);
+        assert_eq!(esp.entries[0].source_crate, "bootloader");
+        assert_eq!(esp.entries[0].dest_path, "EFI/BOOT/BOOTX64.EFI");
+        assert_eq!(
+            esp.entries[0].source_crate_handle,
+            model.crates.lookup("bootloader")
+        );
+    }
+
+    #[test]
+    fn esp_duplicate_declaration_is_diagnostic() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            let g = group("k").target("x");
+            g.add("bl","crates/bl").crate_type("bin");
+            esp("default").add("bl","EFI/BOOT/BOOTX64.EFI");
+            esp("default").add("bl","EFI/BOOT/BOOTX64.EFI");
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("duplicate esp should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter()
+                        .any(|d| d.message.contains("esp") && d.message.contains("more than once")),
+                    "expected duplicate-esp diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esp_entry_referencing_unknown_crate_is_diagnostic() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            esp("default").add("ghost","EFI/BOOT/BOOTX64.EFI");
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("unknown source crate should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter().any(|d| d.message.contains("ghost")
+                        && d.message.contains("does not exist")),
+                    "expected unknown-source-crate diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esp_add_rejects_absolute_destination_path() {
+        let f = write_script(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            let g = group("k").target("x");
+            g.add("bl","crates/bl").crate_type("bin");
+            esp("default").add("bl","/EFI/BOOT/BOOTX64.EFI");
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("absolute dest path should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter().any(|d| d.message.contains("relative to the ESP root")),
+                    "expected relative-path diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn validate_detects_profile_cycle() {
         let f = write_script(
             r#"

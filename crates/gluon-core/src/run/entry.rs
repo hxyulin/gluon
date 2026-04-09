@@ -16,7 +16,7 @@ use super::resolve::resolve_qemu;
 use crate::compile::CompileCtx;
 use crate::error::{Error, Result};
 use crate::{build_with_workers, model::BootMode};
-use gluon_model::{BuildModel, ResolvedConfig};
+use gluon_model::{BuildModel, EspSource, ResolvedConfig};
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
@@ -105,14 +105,18 @@ pub fn run(
     // re-checking timestamps". If the boot binary actually is stale
     // or missing, QEMU will fail at load time with a clearer
     // diagnostic than gluon would produce by trying to second-guess.
-    if !opts.dry_run && !opts.no_build {
+    // Captured if we actually built — carries the ESP output paths
+    // used by Step 4 to auto-wire QEMU's `-drive fat:rw:` flag.
+    let build_summary = if !opts.dry_run && !opts.no_build {
         let workers = opts.workers.unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
         });
-        let _summary = build_with_workers(ctx, model, resolved, workers)?;
-    }
+        Some(build_with_workers(ctx, model, resolved, workers)?)
+    } else {
+        None
+    };
 
     // Step 2: locate boot binary.
     let profile = &resolved.profile;
@@ -131,10 +135,11 @@ pub fn run(
             profile.name
         ))
     })?;
+    let suffix = crate::compile::compile_crate::exe_suffix_for_target(&target.spec);
     let kernel: PathBuf = ctx
         .layout
         .cross_final_dir(target, profile)
-        .join(&krate.name);
+        .join(format!("{}{suffix}", crate::compile::compile_crate::normalize_crate_name(&krate.name)));
 
     // Step 3: resolve QEMU config.
     //
@@ -143,13 +148,60 @@ pub fn run(
     // JSON specs it's the spec path — which users typically name with
     // the arch prefix, so the arch-prefix match in
     // `default_binary_for_target` still has a reasonable shot.
-    let resolved_qemu = resolve_qemu(
+    let mut resolved_qemu = resolve_qemu(
         &model.qemu,
         profile,
         &target.spec,
         opts.boot_mode_override,
         opts.timeout_override,
     )?;
+
+    // Step 3b: auto-wire the ESP directory for UEFI boot.
+    //
+    // If the final boot mode is UEFI, the user has NOT set an explicit
+    // `qemu().esp_dir()` / `esp_image()`, and the project declares
+    // exactly one `esp(...)` block, then point QEMU at the build-output
+    // ESP directory we just assembled (or, in dry-run / --no-build
+    // mode, at the path we *would* have assembled via pure path
+    // arithmetic). More than one declared ESP is an error: the user
+    // must pick explicitly because we can't guess. Zero declarations
+    // falls through — QEMU will simply have no ESP drive, same as
+    // before this feature existed.
+    if resolved_qemu.boot_mode == BootMode::Uefi && resolved_qemu.esp.is_none() {
+        match model.esps.len() {
+            0 => { /* no automation requested */ }
+            1 => {
+                // Prefer the path the build actually produced, so a
+                // test-only run (without build) never disagrees with a
+                // real build. Fall back to path arithmetic when we
+                // didn't build (dry-run / --no-build).
+                let esp_handle = model
+                    .esps
+                    .iter()
+                    .next()
+                    .map(|(h, _)| h)
+                    .expect("model.esps.len() == 1");
+                let esp_def = model.esps.get(esp_handle).ok_or_else(|| {
+                    Error::Compile(
+                        "internal: esp handle iterates but does not resolve".to_string(),
+                    )
+                })?;
+                let esp_path = build_summary
+                    .as_ref()
+                    .and_then(|s| s.esp_dirs.get(&esp_handle).cloned())
+                    .unwrap_or_else(|| ctx.layout.esp_dir(target, profile, &esp_def.name));
+                resolved_qemu.esp = Some(EspSource::Dir(esp_path));
+            }
+            n => {
+                return Err(Error::Compile(format!(
+                    "profile '{}' uses boot_mode('uefi') and the project declares {} esp(...) blocks; \
+                     gluon can't guess which one to mount. Set qemu().esp_dir(...) explicitly, \
+                     or remove the extra esp declarations.",
+                    profile.name, n
+                )));
+            }
+        }
+    }
 
     // Step 4: OVMF (only when the final boot mode is UEFI).
     let ovmf = if resolved_qemu.boot_mode == BootMode::Uefi {
@@ -184,6 +236,12 @@ pub fn run(
         ovmf.as_ref(),
         &extra_args_with_gdb,
         opts.test_mode,
+        // Skip ESP existence checks in dry-run / --no-build. In dry-run
+        // we haven't built anything, so the auto-wired ESP path does
+        // not exist on disk; in --no-build the user is asserting the
+        // build tree is already current, and QEMU will report a better
+        // error than we can if they're wrong.
+        opts.dry_run || opts.no_build,
     )?;
 
     // Step 6: dry-run or spawn.

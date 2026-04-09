@@ -23,7 +23,9 @@
 //! size of the arena being walked.
 
 use crate::error::Diagnostic;
-use gluon_model::{BuildModel, CrateDef, GroupDef, Handle, PipelineDef, ProfileDef, TargetDef};
+use gluon_model::{
+    BuildModel, CrateDef, EspDef, GroupDef, Handle, PipelineDef, ProfileDef, TargetDef,
+};
 
 /// Outer per-pipeline, inner per-stage, innermost per-input resolved handle.
 type PipelineInputResolution = (Handle<PipelineDef>, Vec<Vec<Option<Handle<GroupDef>>>>);
@@ -39,6 +41,7 @@ pub(crate) fn intern(model: &mut BuildModel) -> Vec<Diagnostic> {
     intern_groups(model, &mut diags);
     intern_crates(model, &mut diags);
     intern_pipelines(model, &mut diags);
+    intern_esps(model, &mut diags);
     diags
 }
 
@@ -279,6 +282,41 @@ fn intern_pipelines(model: &mut BuildModel, diags: &mut Vec<Diagnostic>) {
         if let Some(pipeline) = model.pipelines.get_mut(handle) {
             for (stage, resolved) in pipeline.stages.iter_mut().zip(per_stage) {
                 stage.inputs_handles = resolved;
+            }
+        }
+    }
+}
+
+/// Resolve `EspEntry::source_crate` names to crate handles. Dangling
+/// references push a diagnostic and leave the handle `None` — the DAG
+/// builder will then skip that entry, so a missing crate name is
+/// non-fatal (diagnostic-only) at this layer.
+fn intern_esps(model: &mut BuildModel, diags: &mut Vec<Diagnostic>) {
+    type EspResolution = (Handle<EspDef>, Vec<Option<Handle<CrateDef>>>);
+    let mut updates: Vec<EspResolution> = Vec::with_capacity(model.esps.len());
+
+    for (handle, esp) in model.esps.iter() {
+        let mut resolved = Vec::with_capacity(esp.entries.len());
+        for entry in &esp.entries {
+            let h = model.crates.lookup(&entry.source_crate);
+            if h.is_none() {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "esp(\"{}\").add: source crate '{}' does not exist in the model",
+                        esp.name, entry.source_crate
+                    ))
+                    .with_optional_span(esp.span.clone()),
+                );
+            }
+            resolved.push(h);
+        }
+        updates.push((handle, resolved));
+    }
+
+    for (handle, resolved) in updates {
+        if let Some(esp) = model.esps.get_mut(handle) {
+            for (entry, handle) in esp.entries.iter_mut().zip(resolved) {
+                entry.source_crate_handle = handle;
             }
         }
     }

@@ -5,7 +5,8 @@ use crate::engine::EngineState;
 use crate::engine::conversions::array_to_string_vec;
 use crate::error::Diagnostic;
 use gluon_model::{
-    BootMode, EspSource, PipelineDef, PipelineStep, RuleDef, RuleHandler, SerialMode,
+    BootMode, EspDef, EspEntry, EspSource, PipelineDef, PipelineStep, RuleDef, RuleHandler,
+    SerialMode,
 };
 use rhai::{Dynamic, Engine, NativeCallContext, Position};
 use std::path::PathBuf;
@@ -58,6 +59,18 @@ pub struct BootloaderBuilder {
     is_duplicate: bool,
 }
 
+/// Chainable builder returned by `esp("name")`. Appends
+/// `(source_crate, dest_path)` entries into [`gluon_model::EspDef::entries`]
+/// via `.add(...)` calls. Duplicate declarations (two `esp("name")` calls
+/// with the same name) emit a diagnostic and the second call short-circuits.
+#[derive(Clone)]
+pub struct EspBuilder {
+    state: EngineState,
+    name: String,
+    pos: Position,
+    is_duplicate: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Registration entry point
 // ---------------------------------------------------------------------------
@@ -67,6 +80,7 @@ pub(super) fn register(engine: &mut Engine, state: &EngineState) {
     register_pipeline(engine, state.clone());
     register_qemu(engine, state.clone());
     register_bootloader(engine, state.clone());
+    register_esp(engine, state.clone());
 }
 
 // ---------------------------------------------------------------------------
@@ -650,4 +664,115 @@ fn register_bootloader(engine: &mut Engine, state: EngineState) {
             builder.clone()
         },
     );
+}
+
+// ---------------------------------------------------------------------------
+// esp("name") — builder that describes an EFI System Partition to
+// assemble from compiled artifacts. Supports multiple named ESPs per
+// project (different bootloaders / boot stages can each have their own).
+// ---------------------------------------------------------------------------
+
+fn register_esp(engine: &mut Engine, state: EngineState) {
+    let s = state;
+    let s1 = s.clone();
+    engine.register_fn(
+        "esp",
+        move |ctx: NativeCallContext, name: &str| -> EspBuilder {
+            start_esp(&s1, ctx.call_position(), name)
+        },
+    );
+
+    // `.add("crate-name", "EFI/BOOT/BOOTX64.EFI")`
+    // Appends an entry to the ESP. The source crate is resolved later
+    // by the scheduler (no handle on the model-side yet — that happens
+    // in the intern pass).
+    engine.register_fn(
+        "add",
+        |builder: &mut EspBuilder, source_crate: &str, dest_path: &str| -> EspBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            if source_crate.is_empty() {
+                builder.state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "esp(\"{}\").add: source crate name must not be empty",
+                        builder.name
+                    ))
+                    .with_span(builder.state.span_from(builder.pos)),
+                );
+                return builder.clone();
+            }
+            if dest_path.is_empty() {
+                builder.state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "esp(\"{}\").add: destination path must not be empty",
+                        builder.name
+                    ))
+                    .with_span(builder.state.span_from(builder.pos)),
+                );
+                return builder.clone();
+            }
+            // Leading slashes in the dest path would resolve outside the
+            // ESP root when joined, which is almost certainly a bug.
+            // ESP paths are relative to the partition root by convention
+            // (e.g. "EFI/BOOT/BOOTX64.EFI"), not rooted absolutes.
+            if dest_path.starts_with('/') || dest_path.starts_with('\\') {
+                builder.state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "esp(\"{}\").add: destination path '{}' must be relative to the ESP root (no leading '/')",
+                        builder.name, dest_path
+                    ))
+                    .with_span(builder.state.span_from(builder.pos)),
+                );
+                return builder.clone();
+            }
+
+            let mut model = builder.state.model.borrow_mut();
+            if let Some(h) = model.esps.lookup(&builder.name) {
+                if let Some(esp) = model.esps.get_mut(h) {
+                    esp.entries.push(EspEntry {
+                        source_crate: source_crate.into(),
+                        source_crate_handle: None,
+                        dest_path: dest_path.into(),
+                    });
+                }
+            }
+            drop(model);
+            builder.clone()
+        },
+    );
+}
+
+// --- esp() helpers ---
+
+fn start_esp(s: &EngineState, pos: Position, name: &str) -> EspBuilder {
+    let span = s.span_from(pos);
+    if name.is_empty() {
+        s.push_diagnostic(
+            Diagnostic::error("esp() name must not be empty".to_string()).with_span(span.clone()),
+        );
+    }
+    let mut model = s.model.borrow_mut();
+    let (_h, inserted) = model.esps.insert(
+        name.into(),
+        EspDef {
+            name: name.into(),
+            entries: Vec::new(),
+            span: Some(span.clone()),
+        },
+    );
+    let is_duplicate = !inserted;
+    drop(model);
+    if is_duplicate {
+        s.push_diagnostic(
+            Diagnostic::error(format!("esp(\"{name}\") is defined more than once"))
+                .with_span(span),
+        );
+    }
+    EspBuilder {
+        state: s.clone(),
+        name: name.into(),
+        pos,
+        is_duplicate,
+    }
 }

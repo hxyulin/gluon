@@ -502,6 +502,7 @@ fn register_group(engine: &mut Engine, state: EngineState) {
                 rustc_flags: Vec::new(),
                 requires_config: Vec::new(),
                 artifact_deps: Vec::new(),
+                artifact_env: Default::default(),
                 span: Some(span.clone()),
             };
 
@@ -695,6 +696,46 @@ fn register_crate_methods(engine: &mut Engine) {
                     Diagnostic::error(format!("crate '{name}' artifact_deps: {msg}"))
                         .with_span(state.span_from(pos)),
                 ),
+            }
+        }
+    );
+
+    // `.artifact_env("KERNEL_PATH", "kernel")` — inject an env var at
+    // rustc invocation time whose value is the referenced crate's
+    // primary output path (absolute, canonicalised). Automatically
+    // adds the referenced crate to `artifact_deps` so the DAG enforces
+    // build ordering and users can't forget the ordering edge.
+    //
+    // Duplicates are overwritten (last-call-wins for the same key).
+    // An empty key or value is rejected with a diagnostic.
+    builder_method!(
+        engine,
+        "artifact_env",
+        CrateBuilder,
+        |state, model, name, pos, key: &str, dep_name: &str| {
+            if key.is_empty() {
+                state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "crate '{name}' artifact_env: environment variable name must not be empty"
+                    ))
+                    .with_span(state.span_from(pos)),
+                );
+            } else if dep_name.is_empty() {
+                state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "crate '{name}' artifact_env: referenced crate name must not be empty"
+                    ))
+                    .with_span(state.span_from(pos)),
+                );
+            } else if let Some(h) = model.crates.lookup(name) {
+                if let Some(k) = model.crates.get_mut(h) {
+                    k.artifact_env.insert(key.into(), dep_name.into());
+                    // Auto-add the ordering edge — users can't get this
+                    // wrong. Skip if already present (idempotent).
+                    if !k.artifact_deps.iter().any(|d| d == dep_name) {
+                        k.artifact_deps.push(dep_name.into());
+                    }
+                }
             }
         }
     );

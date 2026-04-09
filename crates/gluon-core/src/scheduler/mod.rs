@@ -24,7 +24,7 @@ use crate::compile::{ArtifactMap, CompileCrateInput, CompileCtx, compile_crate};
 use crate::error::{Error, Result};
 use crate::rule::{RuleCtx, RuleRegistry};
 use dag::Dag as DagType;
-use gluon_model::{BuildModel, Handle, ResolvedConfig, TargetDef};
+use gluon_model::{BuildModel, EspDef, Handle, ResolvedConfig, TargetDef};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -53,6 +53,10 @@ struct PipelineDispatcher<'a> {
     /// Built crate artifact paths. Written by `ConfigCrate` and `Crate`
     /// nodes; read (snapshotted) by each `Crate` node before compiling.
     artifacts: &'a Mutex<ArtifactMap>,
+    /// Assembled ESP directories keyed by `EspDef` handle. Written by
+    /// `Esp` nodes; read by `run::entry` after the build completes to
+    /// auto-wire the ESP into QEMU's `-drive fat:rw:` flag.
+    esps: &'a Mutex<BTreeMap<Handle<EspDef>, PathBuf>>,
     /// Lock-free counter for nodes that ran rustc to completion.
     /// `Rule` nodes are not counted (they are not cacheable in MVP-M).
     built: &'a AtomicUsize,
@@ -199,6 +203,37 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
             }
 
             // ------------------------------------------------------------------
+            // Esp — assemble an EFI System Partition directory from
+            // built crate artifacts. See helpers::esp::ensure_esp.
+            // ------------------------------------------------------------------
+            DagNode::Esp(esp_handle) => {
+                // Snapshot the ArtifactMap so the helper can resolve
+                // source-crate handles to their artifact paths without
+                // holding the lock across the filesystem copy. Pattern
+                // mirrors the `Crate` arm above.
+                let artifacts_snapshot = self
+                    .artifacts
+                    .lock()
+                    .map_err(|_| Error::Config("scheduler: artifacts mutex poisoned".into()))?
+                    .clone();
+                let (path, was_cached) = helpers::esp::ensure_esp(
+                    self.ctx,
+                    self.model,
+                    self.resolved,
+                    esp_handle,
+                    &artifacts_snapshot,
+                    stdout,
+                )?;
+                self.esps
+                    .lock()
+                    .map_err(|_| Error::Config("scheduler: esps mutex poisoned".into()))?
+                    .insert(esp_handle, path);
+                self.record(was_cached);
+                let _ = stderr;
+                Ok(())
+            }
+
+            // ------------------------------------------------------------------
             // Rule — run a user-declared rule through the registry.
             // ------------------------------------------------------------------
             DagNode::Rule(rule_handle) => {
@@ -258,6 +293,7 @@ pub fn execute_pipeline(
 
     let sysroots: Mutex<BTreeMap<Handle<TargetDef>, PathBuf>> = Mutex::new(BTreeMap::new());
     let artifacts: Mutex<ArtifactMap> = Mutex::new(ArtifactMap::new());
+    let esps: Mutex<BTreeMap<Handle<EspDef>, PathBuf>> = Mutex::new(BTreeMap::new());
     // `Relaxed` is sufficient: we only need atomicity, not ordering
     // relative to other memory operations. The counters are read once
     // after `pool.execute` returns (a happens-before point already
@@ -273,6 +309,7 @@ pub fn execute_pipeline(
         dag: &dag,
         sysroots: &sysroots,
         artifacts: &artifacts,
+        esps: &esps,
         built: &built,
         cached: &cached,
     };
@@ -280,9 +317,16 @@ pub fn execute_pipeline(
     let pool = WorkerPool::new(workers);
     pool.execute(&dag, &dispatcher, stdout, stderr)?;
 
+    // Drain the esps map into the summary. The mutex is uncontested at
+    // this point (the worker pool has joined), so `into_inner` is safe.
+    let esp_dirs = esps
+        .into_inner()
+        .map_err(|_| Error::Config("scheduler: esps mutex poisoned".into()))?;
+
     Ok(BuildSummary {
         built: built.load(Ordering::Relaxed),
         cached: cached.load(Ordering::Relaxed),
+        esp_dirs,
     })
 }
 

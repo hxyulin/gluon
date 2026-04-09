@@ -20,7 +20,32 @@ pub(crate) fn validate(model: &BuildModel) -> Vec<Diagnostic> {
     check_profile_inheritance_cycles(model, &mut diags);
     check_crate_output_name_uniqueness(model, &mut diags);
     check_pipeline_stage_references(model, &mut diags);
+    check_artifact_deps_resolve(model, &mut diags);
     diags
+}
+
+/// Reject `CrateDef::artifact_deps` entries that don't name a real crate.
+///
+/// `artifact_deps` is a list of crate names (not handles — Rhai callers can
+/// only type strings) that produce ordering-only DAG edges. Unlike regular
+/// `deps`, there's no intern pass that fills in a `crate_handle`, so the
+/// first time we'd notice a typo is when `build_dag` silently drops the
+/// edge and the bootloader sees stale (or missing) kernel bytes. Catch it
+/// at validate time where we can still point at the crate's span.
+fn check_artifact_deps_resolve(model: &BuildModel, diags: &mut Vec<Diagnostic>) {
+    for (_handle, crate_def) in model.crates.iter() {
+        for dep_name in &crate_def.artifact_deps {
+            if model.crates.lookup(dep_name).is_none() {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "crate '{}' declares artifact_deps entry '{}', but no crate with that name exists in the model",
+                        crate_def.name, dep_name
+                    ))
+                    .with_optional_span(crate_def.span.clone()),
+                );
+            }
+        }
+    }
 }
 
 /// Reject `project().default_profile("name")` when "name" doesn't
@@ -284,6 +309,34 @@ mod tests {
             msg.contains("dev") && msg.contains("release"),
             "diag must list known profiles: {msg}"
         );
+    }
+
+    #[test]
+    fn artifact_deps_unknown_name_errors() {
+        let mut model = BuildModel::default();
+        let mut consumer = make_crate("consumer");
+        consumer.artifact_deps = vec!["ghost".into()];
+        let _ = model.crates.insert("consumer".into(), consumer);
+
+        let mut diags = Vec::new();
+        check_artifact_deps_resolve(&model, &mut diags);
+        assert_eq!(diags.len(), 1, "expected one dangling-artifact_dep diagnostic");
+        let msg = &diags[0].message;
+        assert!(msg.contains("consumer"), "diag must name the consumer crate: {msg}");
+        assert!(msg.contains("ghost"), "diag must name the missing target: {msg}");
+    }
+
+    #[test]
+    fn artifact_deps_existing_name_passes() {
+        let mut model = BuildModel::default();
+        let _ = model.crates.insert("kernel".into(), make_crate("kernel"));
+        let mut bootloader = make_crate("bootloader");
+        bootloader.artifact_deps = vec!["kernel".into()];
+        let _ = model.crates.insert("bootloader".into(), bootloader);
+
+        let mut diags = Vec::new();
+        check_artifact_deps_resolve(&model, &mut diags);
+        assert!(diags.is_empty(), "no diag expected, got: {diags:?}");
     }
 
     #[test]

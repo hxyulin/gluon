@@ -289,6 +289,13 @@ impl RustcCommandBuilder {
         &self.args
     }
 
+    /// Borrow the env-var map that will be merged into the spawned command's
+    /// environment. Useful for tests and diagnostics that want to assert on
+    /// which env vars this invocation will see.
+    pub fn envs(&self) -> &BTreeMap<OsString, OsString> {
+        &self.env
+    }
+
     pub fn rustc_path(&self) -> &Path {
         &self.rustc
     }

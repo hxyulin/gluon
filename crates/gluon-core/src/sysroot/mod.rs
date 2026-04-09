@@ -291,6 +291,7 @@ fn build_sysroot_crate(
         output_rlib,
         depfile_path,
         None,
+        Vec::new(), // sysroot crates have no out-of-band inputs
         Box::new(move |output, rendered| {
             Error::Diagnostics(vec![
                 Diagnostic::error(format!(
