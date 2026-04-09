@@ -18,12 +18,13 @@
 //! built-in `exec` rule treats inputs as the command + argv and ignores
 //! outputs (which the scheduler uses for cache-invalidation bookkeeping).
 
-use crate::compile::BuildLayout;
+use crate::compile::{ArtifactMap, BuildLayout};
 use crate::error::{Error, Result};
-use gluon_model::{BuildModel, ResolvedConfig, RuleDef, RuleHandler, TargetDef};
+use gluon_model::{BuildModel, CrateDef, ResolvedConfig, RuleDef, RuleHandler, TargetDef};
 use std::collections::BTreeMap;
 
 pub mod builtin;
+pub mod script;
 
 /// Execution context handed to a [`RuleFn`] when the scheduler invokes a rule.
 ///
@@ -38,6 +39,7 @@ pub struct RuleCtx<'a> {
     pub layout: &'a BuildLayout,
     pub resolved: &'a ResolvedConfig,
     pub model: &'a BuildModel,
+    pub artifacts: &'a ArtifactMap,
 }
 
 /// A rule handler. Implementations receive pre-substituted argument strings —
@@ -60,6 +62,8 @@ pub trait RuleFn: Send + Sync {
         rule: &RuleDef,
         inputs: &[String],
         outputs: &[String],
+        stdout: &mut Vec<u8>,
+        stderr: &mut Vec<u8>,
     ) -> Result<()>;
 }
 
@@ -122,15 +126,19 @@ impl RuleRegistry {
     ///   and the unknown variable.
     /// - Substitution encounters an unterminated `${...}` — message names the
     ///   rule and the offending token.
-    pub fn dispatch(&self, ctx: &RuleCtx<'_>, rule: &RuleDef) -> Result<()> {
-        // Script handlers are deferred to a post-MVP-M chunk.
+    pub fn dispatch(
+        &self,
+        ctx: &RuleCtx<'_>,
+        rule: &RuleDef,
+        stdout: &mut Vec<u8>,
+        stderr: &mut Vec<u8>,
+    ) -> Result<()> {
+        // Script handlers delegate to the embedded Rhai engine.
         let builtin_name = match &rule.handler {
-            RuleHandler::Script(fn_name) => {
-                return Err(Error::Compile(format!(
-                    "rule '{}': script-backed rules (handler: '{}') are not implemented \
-                     in MVP-M — this feature is deferred to a later chunk",
-                    rule.name, fn_name
-                )));
+            RuleHandler::Script(_) => {
+                let inputs = substitute_args(ctx, rule, &rule.inputs)?;
+                let outputs = substitute_args(ctx, rule, &rule.outputs)?;
+                return script::execute_script(ctx, rule, &inputs, &outputs, stdout, stderr);
             }
             RuleHandler::Builtin(name) => name,
         };
@@ -150,7 +158,7 @@ impl RuleRegistry {
         let inputs = substitute_args(ctx, rule, &rule.inputs)?;
         let outputs = substitute_args(ctx, rule, &rule.outputs)?;
 
-        handler.execute(ctx, rule, &inputs, &outputs)
+        handler.execute(ctx, rule, &inputs, &outputs, stdout, stderr)
     }
 }
 
@@ -158,9 +166,12 @@ impl RuleRegistry {
 // ${var} substitution
 // ---------------------------------------------------------------------------
 
-/// The set of variable names recognised by the substitution engine. Kept as a
-/// sorted slice so error messages listing known vars are deterministic.
-const KNOWN_VARS: &[&str] = &["build_dir", "profile", "project_name", "target"];
+/// The set of simple variable names recognised by the substitution engine.
+/// Kept as a sorted slice so error messages are deterministic.
+///
+/// In addition to these, the prefixed form `${artifact:<crate_name>}` resolves
+/// to the output path of a compiled crate.
+const KNOWN_VARS: &[&str] = &["build_dir", "profile", "project_name", "project_root", "target"];
 
 /// Substitute all `${var}` tokens in a list of argument strings.
 ///
@@ -178,19 +189,18 @@ fn substitute_args(ctx: &RuleCtx<'_>, rule: &RuleDef, args: &[String]) -> Result
 ///
 /// ### Substitution behaviour
 ///
-/// - A bare `$` not followed by `{` is emitted literally. Escape sequences
-///   (`$${...}`) are **not** supported in MVP-M; document this clearly so
-///   callers are not surprised.
-/// - `${build_dir}` → `ctx.layout.root().display().to_string()`
-/// - `${project_name}` → `ctx.resolved.project.name.clone()`
-/// - `${profile}` → `ctx.resolved.profile.name.clone()`
-/// - `${target}` → the `name` of the target referenced by
-///   `ctx.resolved.profile.target` via `ctx.model.targets`. A missing
-///   target is treated as an internal bug (it should never happen after
-///   the intern pass) and surfaces a clear error rather than a panic.
+/// - `$$` produces a literal `$` (escape mechanism).
+/// - `$${foo}` produces a literal `${foo}`.
+/// - A bare `$` not followed by `$` or `{` is emitted literally.
+/// - `${build_dir}` → the build output directory
+/// - `${project_name}` → the project name from config
+/// - `${project_root}` → the project root directory
+/// - `${profile}` → the active profile name
+/// - `${target}` → the target triple name
+/// - `${artifact:<name>}` → the compiled output path for the named crate
 fn substitute_one(ctx: &RuleCtx<'_>, rule: &RuleDef, s: &str) -> Result<String> {
     // Fast path: no substitution needed.
-    if !s.contains("${") {
+    if !s.contains('$') {
         return Ok(s.to_owned());
     }
 
@@ -199,12 +209,12 @@ fn substitute_one(ctx: &RuleCtx<'_>, rule: &RuleDef, s: &str) -> Result<String> 
     let mut i = 0;
 
     while i < bytes.len() {
-        // Look for `$`. If it's not followed by `{`, emit it literally and
-        // advance. Supporting `$${` escapes is intentionally left out of
-        // MVP-M — callers that need a literal `${` must restructure their
-        // command rather than relying on escaping.
         if bytes[i] == b'$' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            // `$$` → literal `$` (escape).
+            if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                out.push('$');
+                i += 2;
+            } else if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
                 // Opening `${` found — scan forward for `}`.
                 let var_start = i + 2; // first byte of variable name
                 let var_end = bytes[var_start..]
@@ -249,18 +259,23 @@ fn substitute_one(ctx: &RuleCtx<'_>, rule: &RuleDef, s: &str) -> Result<String> 
 
 /// Resolve a single variable name to its string value.
 ///
-/// Returns `Error::Compile` if `var_name` is not in [`KNOWN_VARS`], naming
-/// the rule and listing all known variable names for discoverability.
+/// Handles simple variables (`build_dir`, `profile`, etc.) and the prefixed
+/// form `artifact:<crate_name>` which resolves to a compiled artifact path.
+///
+/// Returns `Error::Compile` for unknown variables, naming the rule and
+/// listing known variables for discoverability.
 fn resolve_var(ctx: &RuleCtx<'_>, rule: &RuleDef, var_name: &str) -> Result<String> {
+    // Prefixed variables: ${artifact:<crate_name>}
+    if let Some(crate_name) = var_name.strip_prefix("artifact:") {
+        return resolve_artifact(ctx, rule, crate_name);
+    }
+
     match var_name {
         "build_dir" => Ok(ctx.layout.root().display().to_string()),
         "project_name" => Ok(ctx.resolved.project.name.clone()),
+        "project_root" => Ok(ctx.resolved.project_root.display().to_string()),
         "profile" => Ok(ctx.resolved.profile.name.clone()),
         "target" => {
-            // Dereference the profile's target handle via the build model.
-            // This should never fail after the intern pass completes — if it
-            // does, it is an internal bug rather than a user error, but we
-            // surface it with a clear message rather than panicking.
             let target: &TargetDef = ctx
                 .model
                 .targets
@@ -276,12 +291,52 @@ fn resolve_var(ctx: &RuleCtx<'_>, rule: &RuleDef, var_name: &str) -> Result<Stri
         }
         unknown => Err(Error::Compile(format!(
             "rule '{}': unknown substitution variable '${{{}}}'; \
-             known variables: [{}]",
+             known variables: [{}], or use ${{artifact:<crate_name>}}",
             rule.name,
             unknown,
             KNOWN_VARS.join(", ")
         ))),
     }
+}
+
+/// Resolve `${artifact:<crate_name>}` to the compiled output path.
+///
+/// Looks up the crate by name in the build model, then retrieves its artifact
+/// path from the snapshot. Returns clear errors if the crate doesn't exist or
+/// hasn't been compiled yet.
+fn resolve_artifact(ctx: &RuleCtx<'_>, rule: &RuleDef, crate_name: &str) -> Result<String> {
+    if crate_name.is_empty() {
+        return Err(Error::Compile(format!(
+            "rule '{}': empty crate name in ${{artifact:}}",
+            rule.name
+        )));
+    }
+
+    let handle = ctx.model.crates.lookup(crate_name).ok_or_else(|| {
+        let available: Vec<&str> = ctx
+            .model
+            .crates
+            .iter()
+            .map(|(_, c): (_, &CrateDef)| c.name.as_str())
+            .collect();
+        Error::Compile(format!(
+            "rule '{}': ${{artifact:{}}} references unknown crate; \
+             available crates: [{}]",
+            rule.name,
+            crate_name,
+            available.join(", ")
+        ))
+    })?;
+
+    let path = ctx.artifacts.get(handle).ok_or_else(|| {
+        Error::Compile(format!(
+            "rule '{}': ${{artifact:{}}} — crate exists but has no compiled \
+             artifact (ensure the rule's pipeline stage depends on the crate's group)",
+            rule.name, crate_name
+        ))
+    })?;
+
+    Ok(path.display().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +357,7 @@ mod tests {
     /// Shared helper module so builtin.rs tests can `use super::test_support::*`.
     pub(crate) mod test_support {
         use super::*;
-        use crate::compile::BuildLayout;
+        use crate::compile::{ArtifactMap, BuildLayout};
         use gluon_model::{ResolvedConfig, ResolvedProfile};
 
         pub fn make_target(name: &str) -> TargetDef {
@@ -358,17 +413,21 @@ mod tests {
             }
         }
 
-        /// Build a `(BuildLayout, BuildModel, ResolvedConfig)` triple for testing.
+        /// Build a `(BuildLayout, BuildModel, ResolvedConfig, ArtifactMap)` tuple
+        /// for testing.
         ///
         /// `tmp` should be a `tempfile::TempDir` base; the build dir is
         /// `tmp/build`.
-        pub fn make_ctx_parts(tmp: &std::path::Path) -> (BuildLayout, BuildModel, ResolvedConfig) {
+        pub fn make_ctx_parts(
+            tmp: &std::path::Path,
+        ) -> (BuildLayout, BuildModel, ResolvedConfig, ArtifactMap) {
             let build_dir = tmp.join("build");
             std::fs::create_dir_all(&build_dir).unwrap();
             let (model, target_handle) = make_model_with_target("x86_64-test");
             let resolved = make_resolved(target_handle, build_dir.clone());
             let layout = BuildLayout::new(build_dir, "testproject");
-            (layout, model, resolved)
+            let artifacts = ArtifactMap::new();
+            (layout, model, resolved, artifacts)
         }
     }
 
@@ -399,6 +458,8 @@ mod tests {
                 _rule: &RuleDef,
                 _inputs: &[String],
                 _outputs: &[String],
+                _stdout: &mut Vec<u8>,
+                _stderr: &mut Vec<u8>,
             ) -> Result<()> {
                 Ok(())
             }
@@ -408,11 +469,12 @@ mod tests {
         registry.register("fake", Box::new(FakeRule));
 
         let tmp = tempfile::tempdir().unwrap();
-        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
         let ctx = RuleCtx {
             layout: &layout,
             resolved: &resolved,
             model: &model,
+            artifacts: &artifacts,
         };
         let rule = RuleDef {
             name: "myrule".into(),
@@ -420,10 +482,11 @@ mod tests {
             outputs: vec![],
             depends_on: vec![],
             handler: RuleHandler::Builtin("nope".into()),
+            working_dir: None,
             span: None,
         };
 
-        let err = registry.dispatch(&ctx, &rule).unwrap_err();
+        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
         match err {
             Error::Compile(msg) => {
                 assert!(
@@ -441,30 +504,68 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_script_handler_returns_not_implemented_error() {
+    fn dispatch_script_handler_executes_rhai_script() {
         let registry = RuleRegistry::new();
         let tmp = tempfile::tempdir().unwrap();
-        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
         let ctx = RuleCtx {
             layout: &layout,
             resolved: &resolved,
             model: &model,
+            artifacts: &artifacts,
         };
         let rule = RuleDef {
             name: "scriptrule".into(),
             inputs: vec![],
             outputs: vec![],
             depends_on: vec![],
-            handler: RuleHandler::Script("some_fn".into()),
+            handler: RuleHandler::Script(r#"log("hello from script");"#.into()),
+            working_dir: None,
             span: None,
         };
 
-        let err = registry.dispatch(&ctx, &rule).unwrap_err();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        registry
+            .dispatch(&ctx, &rule, &mut stdout, &mut stderr)
+            .unwrap();
+        let output = String::from_utf8_lossy(&stdout);
+        assert!(
+            output.contains("hello from script"),
+            "script log should appear in stdout: {output}"
+        );
+    }
+
+    #[test]
+    fn dispatch_script_handler_syntax_error_returns_compile_error() {
+        let registry = RuleRegistry::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
+        let ctx = RuleCtx {
+            layout: &layout,
+            resolved: &resolved,
+            model: &model,
+            artifacts: &artifacts,
+        };
+        let rule = RuleDef {
+            name: "badsyntax".into(),
+            inputs: vec![],
+            outputs: vec![],
+            depends_on: vec![],
+            handler: RuleHandler::Script("let x = ;".into()),
+            working_dir: None,
+            span: None,
+        };
+
+        let err = registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap_err();
         match err {
             Error::Compile(msg) => {
+                assert!(msg.contains("badsyntax"), "should name rule: {msg}");
                 assert!(
-                    msg.to_lowercase().contains("script"),
-                    "error should mention 'script': {msg}"
+                    msg.contains("script execution failed"),
+                    "should mention script failure: {msg}"
                 );
             }
             other => panic!("expected Error::Compile, got {other:?}"),
@@ -488,6 +589,8 @@ mod tests {
             _rule: &RuleDef,
             inputs: &[String],
             outputs: &[String],
+            _stdout: &mut Vec<u8>,
+            _stderr: &mut Vec<u8>,
         ) -> Result<()> {
             *self.captured_inputs.lock().unwrap() = inputs.to_vec();
             *self.captured_outputs.lock().unwrap() = outputs.to_vec();
@@ -511,11 +614,12 @@ mod tests {
     #[test]
     fn substitution_expands_known_vars() {
         let tmp = tempfile::tempdir().unwrap();
-        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
         let ctx = RuleCtx {
             layout: &layout,
             resolved: &resolved,
             model: &model,
+            artifacts: &artifacts,
         };
 
         let (captured_inputs, _captured_outputs, handler) = make_capturing_rule();
@@ -533,10 +637,11 @@ mod tests {
             outputs: vec![],
             depends_on: vec![],
             handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule).unwrap();
+        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(args.len(), 4);
@@ -556,11 +661,12 @@ mod tests {
     #[test]
     fn substitution_expands_multiple_vars_in_one_arg() {
         let tmp = tempfile::tempdir().unwrap();
-        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
         let ctx = RuleCtx {
             layout: &layout,
             resolved: &resolved,
             model: &model,
+            artifacts: &artifacts,
         };
 
         let (captured_inputs, _captured_outputs, handler) = make_capturing_rule();
@@ -573,10 +679,11 @@ mod tests {
             outputs: vec![],
             depends_on: vec![],
             handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule).unwrap();
+        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(args, vec!["testproject-debug-x86_64-test".to_string()]);
     }
@@ -587,11 +694,12 @@ mod tests {
     #[test]
     fn substitution_preserves_non_ascii_literal_bytes() {
         let tmp = tempfile::tempdir().unwrap();
-        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
         let ctx = RuleCtx {
             layout: &layout,
             resolved: &resolved,
             model: &model,
+            artifacts: &artifacts,
         };
 
         let (captured_inputs, _captured_outputs, handler) = make_capturing_rule();
@@ -604,10 +712,11 @@ mod tests {
             outputs: vec![],
             depends_on: vec![],
             handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule).unwrap();
+        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(args, vec!["café-debug-naïve".to_string()]);
     }
@@ -615,11 +724,12 @@ mod tests {
     #[test]
     fn substitution_unknown_var_errors_with_rule_name_and_var_name() {
         let tmp = tempfile::tempdir().unwrap();
-        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
         let ctx = RuleCtx {
             layout: &layout,
             resolved: &resolved,
             model: &model,
+            artifacts: &artifacts,
         };
 
         let (_, _, handler) = make_capturing_rule();
@@ -632,10 +742,11 @@ mod tests {
             outputs: vec![],
             depends_on: vec![],
             handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
             span: None,
         };
 
-        let err = registry.dispatch(&ctx, &rule).unwrap_err();
+        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
         match err {
             Error::Compile(msg) => {
                 assert!(msg.contains("badrule"), "should name rule: {msg}");
@@ -650,11 +761,12 @@ mod tests {
     #[test]
     fn substitution_unterminated_brace_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
         let ctx = RuleCtx {
             layout: &layout,
             resolved: &resolved,
             model: &model,
+            artifacts: &artifacts,
         };
 
         let (_, _, handler) = make_capturing_rule();
@@ -667,10 +779,11 @@ mod tests {
             outputs: vec![],
             depends_on: vec![],
             handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
             span: None,
         };
 
-        let err = registry.dispatch(&ctx, &rule).unwrap_err();
+        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
         match err {
             Error::Compile(msg) => {
                 assert!(msg.contains("badrule"), "should name rule: {msg}");
@@ -687,11 +800,12 @@ mod tests {
     #[test]
     fn substitution_literal_dollar_is_preserved() {
         let tmp = tempfile::tempdir().unwrap();
-        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
         let ctx = RuleCtx {
             layout: &layout,
             resolved: &resolved,
             model: &model,
+            artifacts: &artifacts,
         };
 
         let (captured_inputs, _, handler) = make_capturing_rule();
@@ -704,10 +818,11 @@ mod tests {
             outputs: vec![],
             depends_on: vec![],
             handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule).unwrap();
+        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(
@@ -719,11 +834,12 @@ mod tests {
     #[test]
     fn substitution_handles_outputs_too() {
         let tmp = tempfile::tempdir().unwrap();
-        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
         let ctx = RuleCtx {
             layout: &layout,
             resolved: &resolved,
             model: &model,
+            artifacts: &artifacts,
         };
 
         let (_, captured_outputs, handler) = make_capturing_rule();
@@ -736,10 +852,11 @@ mod tests {
             outputs: vec!["${build_dir}/out".into()],
             depends_on: vec![],
             handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule).unwrap();
+        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
 
         let out_args = captured_outputs.lock().unwrap().clone();
         assert_eq!(out_args.len(), 1);
@@ -747,5 +864,235 @@ mod tests {
             out_args[0],
             format!("{}/out", tmp.path().join("build").display())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Artifact substitution tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn substitution_resolves_artifact_by_crate_name() {
+        use gluon_model::CrateDef;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, mut model, resolved, mut artifacts) = make_ctx_parts(tmp.path());
+
+        // Register a crate in the model and record its artifact.
+        let crate_def = CrateDef {
+            name: "kernel".into(),
+            path: "crates/kernel".into(),
+            edition: "2021".into(),
+            crate_type: gluon_model::CrateType::Bin,
+            target: "x86_64-test".into(),
+            target_handle: None,
+            deps: Default::default(),
+            dev_deps: Default::default(),
+            features: vec![],
+            root: None,
+            linker_script: None,
+            group: "kernel_group".into(),
+            group_handle: None,
+            is_project_crate: true,
+            cfg_flags: vec![],
+            rustc_flags: vec![],
+            requires_config: vec![],
+            artifact_deps: vec![],
+            artifact_env: Default::default(),
+            span: None,
+        };
+        let (handle, _) = model.crates.insert("kernel".into(), crate_def);
+        let artifact_path = tmp.path().join("build/cross/x86_64-test/debug/kernel");
+        artifacts.insert(handle, artifact_path.clone());
+
+        let ctx = RuleCtx {
+            layout: &layout,
+            resolved: &resolved,
+            model: &model,
+            artifacts: &artifacts,
+        };
+
+        let (captured_inputs, _, handler) = make_capturing_rule();
+        let mut registry = RuleRegistry::new();
+        registry.register("capture", handler);
+
+        let rule = RuleDef {
+            name: "strip".into(),
+            inputs: vec!["objcopy".into(), "${artifact:kernel}".into()],
+            outputs: vec![],
+            depends_on: vec![],
+            handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
+            span: None,
+        };
+
+        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        let args = captured_inputs.lock().unwrap().clone();
+        assert_eq!(args[1], artifact_path.display().to_string());
+    }
+
+    #[test]
+    fn substitution_artifact_unknown_crate_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
+        let ctx = RuleCtx {
+            layout: &layout,
+            resolved: &resolved,
+            model: &model,
+            artifacts: &artifacts,
+        };
+
+        let (_, _, handler) = make_capturing_rule();
+        let mut registry = RuleRegistry::new();
+        registry.register("capture", handler);
+
+        let rule = RuleDef {
+            name: "badrule".into(),
+            inputs: vec!["${artifact:nonexistent}".into()],
+            outputs: vec![],
+            depends_on: vec![],
+            handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
+            span: None,
+        };
+
+        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        match err {
+            Error::Compile(msg) => {
+                assert!(msg.contains("nonexistent"), "should name crate: {msg}");
+                assert!(msg.contains("badrule"), "should name rule: {msg}");
+            }
+            other => panic!("expected Error::Compile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn substitution_artifact_empty_name_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
+        let ctx = RuleCtx {
+            layout: &layout,
+            resolved: &resolved,
+            model: &model,
+            artifacts: &artifacts,
+        };
+
+        let (_, _, handler) = make_capturing_rule();
+        let mut registry = RuleRegistry::new();
+        registry.register("capture", handler);
+
+        let rule = RuleDef {
+            name: "badrule".into(),
+            inputs: vec!["${artifact:}".into()],
+            outputs: vec![],
+            depends_on: vec![],
+            handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
+            span: None,
+        };
+
+        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        match err {
+            Error::Compile(msg) => {
+                assert!(msg.contains("empty"), "should mention empty: {msg}");
+            }
+            other => panic!("expected Error::Compile, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // project_root and $$ escape tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn substitution_expands_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
+        let ctx = RuleCtx {
+            layout: &layout,
+            resolved: &resolved,
+            model: &model,
+            artifacts: &artifacts,
+        };
+
+        let (captured_inputs, _, handler) = make_capturing_rule();
+        let mut registry = RuleRegistry::new();
+        registry.register("capture", handler);
+
+        let rule = RuleDef {
+            name: "testrule".into(),
+            inputs: vec!["${project_root}/keys/sign.key".into()],
+            outputs: vec![],
+            depends_on: vec![],
+            handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
+            span: None,
+        };
+
+        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        let args = captured_inputs.lock().unwrap().clone();
+        assert_eq!(
+            args[0],
+            format!("{}/keys/sign.key", resolved.project_root.display())
+        );
+    }
+
+    #[test]
+    fn substitution_double_dollar_produces_literal_dollar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
+        let ctx = RuleCtx {
+            layout: &layout,
+            resolved: &resolved,
+            model: &model,
+            artifacts: &artifacts,
+        };
+
+        let (captured_inputs, _, handler) = make_capturing_rule();
+        let mut registry = RuleRegistry::new();
+        registry.register("capture", handler);
+
+        let rule = RuleDef {
+            name: "testrule".into(),
+            inputs: vec!["echo $${HOME}".into()],
+            outputs: vec![],
+            depends_on: vec![],
+            handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
+            span: None,
+        };
+
+        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        let args = captured_inputs.lock().unwrap().clone();
+        assert_eq!(args[0], "echo ${HOME}");
+    }
+
+    #[test]
+    fn substitution_double_dollar_standalone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, model, resolved, artifacts) = make_ctx_parts(tmp.path());
+        let ctx = RuleCtx {
+            layout: &layout,
+            resolved: &resolved,
+            model: &model,
+            artifacts: &artifacts,
+        };
+
+        let (captured_inputs, _, handler) = make_capturing_rule();
+        let mut registry = RuleRegistry::new();
+        registry.register("capture", handler);
+
+        let rule = RuleDef {
+            name: "testrule".into(),
+            inputs: vec!["cost: $$5".into()],
+            outputs: vec![],
+            depends_on: vec![],
+            handler: RuleHandler::Builtin("capture".into()),
+            working_dir: None,
+            span: None,
+        };
+
+        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        let args = captured_inputs.lock().unwrap().clone();
+        assert_eq!(args[0], "cost: $5");
     }
 }

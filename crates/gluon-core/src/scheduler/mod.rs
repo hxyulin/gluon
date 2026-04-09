@@ -238,14 +238,18 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                         rule_handle
                     ))
                 })?;
+                // Snapshot the artifact map so rules can reference compiled
+                // outputs via ${artifact:<crate_name>}. Same lock-and-clone
+                // pattern used by Esp nodes.
+                let artifacts_snapshot =
+                    lock_or_poison(self.artifacts, "artifacts")?.clone();
                 let rule_ctx = RuleCtx {
                     layout: &self.ctx.layout,
                     resolved: self.resolved,
                     model: self.model,
+                    artifacts: &artifacts_snapshot,
                 };
-                self.rules.dispatch(&rule_ctx, rule)?;
-                let _ = stdout;
-                let _ = stderr;
+                self.rules.dispatch(&rule_ctx, rule, stdout, stderr)?;
                 Ok(())
             }
         }

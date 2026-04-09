@@ -928,6 +928,7 @@ mod tests {
                 outputs: vec![],
                 depends_on: vec![],
                 handler: RuleHandler::Builtin("exec".into()),
+                working_dir: None,
                 span: None,
             },
         );
@@ -939,6 +940,7 @@ mod tests {
                 outputs: vec![],
                 depends_on: vec![],
                 handler: RuleHandler::Builtin("exec".into()),
+                working_dir: None,
                 span: None,
             },
         );
@@ -1047,6 +1049,7 @@ mod tests {
                 outputs: vec![],
                 depends_on: vec![],
                 handler: RuleHandler::Builtin("exec".into()),
+                working_dir: None,
                 span: None,
             },
         );

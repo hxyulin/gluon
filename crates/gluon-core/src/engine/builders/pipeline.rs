@@ -113,6 +113,7 @@ fn register_rule(engine: &mut Engine, state: EngineState) {
                     outputs: Vec::new(),
                     depends_on: Vec::new(),
                     handler: RuleHandler::Builtin("exec".into()),
+                    working_dir: None,
                     span: Some(span.clone()),
                 },
             );
@@ -154,6 +155,20 @@ fn register_rule(engine: &mut Engine, state: EngineState) {
             if let Some(h) = model.rules.lookup(name) {
                 if let Some(r) = model.rules.get_mut(h) {
                     r.handler = RuleHandler::Script(script.into());
+                }
+            }
+        }
+    );
+
+    builder_method!(
+        engine,
+        "working_dir",
+        RuleBuilder,
+        |state, model, name, pos, dir: &str| {
+            let _ = (state, pos);
+            if let Some(h) = model.rules.lookup(name) {
+                if let Some(r) = model.rules.get_mut(h) {
+                    r.working_dir = Some(dir.into());
                 }
             }
         }

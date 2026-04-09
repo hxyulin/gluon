@@ -313,6 +313,10 @@ pub struct RuleDef {
     pub outputs: Vec<String>,
     pub depends_on: Vec<String>,
     pub handler: RuleHandler,
+    /// Working directory for rule execution. `None` defaults to the build
+    /// directory. Set to `"project_root"` to run from the project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceSpan>,
 }
