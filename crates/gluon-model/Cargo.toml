@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Pure data types for the Gluon build system."
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

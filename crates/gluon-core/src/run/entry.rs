@@ -409,6 +409,7 @@ fn install_signal_trap() -> Arc<AtomicI32> {
     // the API's contract.
     for &sig in &[signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         let flag_clone = flag.clone();
+        #[allow(unsafe_code)]
         let _ = unsafe {
             signal_hook::low_level::register(sig, move || {
                 flag_clone.store(sig, std::sync::atomic::Ordering::SeqCst);

@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Core library for the Gluon build system: build model, scheduler, compile/cache/vendor primitives."
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 gluon-model.workspace = true
