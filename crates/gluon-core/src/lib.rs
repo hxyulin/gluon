@@ -13,7 +13,10 @@ pub mod error;
 pub mod sysroot;
 
 pub use cache::{BuildRecord, Cache, CacheManifest, FreshnessQuery};
-pub use compile::{BuildLayout, CompileCtx, Emit, RustcCommandBuilder, RustcInfo};
+pub use compile::{
+    ArtifactMap, BuildLayout, CompileCrateInput, CompileCtx, Emit, RustcCommandBuilder, RustcInfo,
+    compile_crate,
+};
 pub use config::resolve;
 pub use engine::evaluate_script;
 pub use error::{Diagnostic, Error, Level, Result};

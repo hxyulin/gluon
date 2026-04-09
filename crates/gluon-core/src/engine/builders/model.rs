@@ -132,6 +132,7 @@ fn register_target(engine: &mut Engine, state: EngineState) {
                     name: name.into(),
                     spec: spec.into(),
                     builtin: false,
+                    panic_strategy: None,
                     span: Some(span.clone()),
                 },
             );
@@ -155,6 +156,7 @@ fn register_target(engine: &mut Engine, state: EngineState) {
                 name: name.into(),
                 spec: name.into(),
                 builtin: true,
+                panic_strategy: None,
                 span: Some(span.clone()),
             },
         );

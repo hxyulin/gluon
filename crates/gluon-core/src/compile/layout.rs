@@ -142,6 +142,7 @@ mod tests {
             name: "x86_64-test".into(),
             spec: "x86_64-unknown-none".into(),
             builtin: true,
+            panic_strategy: None,
             span: None,
         }
     }
@@ -250,12 +251,14 @@ mod tests {
             name: "x86_64-a".into(),
             spec: "x86_64-unknown-none".into(),
             builtin: true,
+            panic_strategy: None,
             span: None,
         };
         let t2 = TargetDef {
             name: "x86_64-b".into(),
             spec: "x86_64-unknown-none".into(),
             builtin: true,
+            panic_strategy: None,
             span: None,
         };
         assert_ne!(l.sysroot_dir(&t1), l.sysroot_dir(&t2));

@@ -52,4 +52,8 @@ pub struct ResolvedConfig {
     pub options: BTreeMap<String, ResolvedValue>,
     pub crates: Vec<ResolvedCrateRef>,
     pub build_dir: PathBuf,
+    /// Absolute path to the project root (the directory containing
+    /// `gluon.rhai`). Used by `compile_crate` to resolve `CrateDef::path`
+    /// and `CrateDef::linker_script` against the project tree.
+    pub project_root: PathBuf,
 }

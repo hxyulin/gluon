@@ -347,6 +347,7 @@ pub fn resolve(
         options: resolved_options,
         crates: resolved_crates,
         build_dir: project_root.join("build"),
+        project_root: project_root.to_path_buf(),
     })
 }
 

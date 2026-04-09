@@ -58,6 +58,16 @@ pub struct TargetDef {
     /// If true, `spec` is a rustc builtin triple (not a file path).
     #[serde(default)]
     pub builtin: bool,
+    /// The panic strategy rustc should use for this target. When `Some`,
+    /// `-C panic=<strategy>` is passed to every rustc invocation that
+    /// builds a crate for this target — including sysroot crates.
+    ///
+    /// Bare-metal targets almost always want `Some("abort")`. Mixing panic
+    /// strategies across sysroot rlibs and downstream crates fails at link
+    /// time with `error: the crate ... is compiled with a different panic
+    /// strategy`, so this must be consistent across all crates for a target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panic_strategy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceSpan>,
 }
@@ -383,6 +393,7 @@ mod tests {
                 name: "x86_64".into(),
                 spec: "x86_64-unknown-none".into(),
                 builtin: true,
+                panic_strategy: None,
                 span: None,
             },
         );

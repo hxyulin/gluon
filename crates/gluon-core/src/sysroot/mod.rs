@@ -221,14 +221,16 @@ fn build_sysroot_crate(
         // performance is never worth trading for a faster sysroot build.
         .opt_level(2)
         .debug_info(false);
-    // TODO(session-B): inherit panic strategy from TargetDef.
-    // Bare-metal targets almost always want `-C panic=abort`, and mixing
-    // panic strategies across sysroot rlibs and downstream crates fails
-    // at link time with `error: the crate ... is compiled with a
-    // different panic strategy`. The plan is to thread a
-    // `panic_strategy: Option<String>` field on TargetDef through the
-    // builder once session B touches target config resolution; for now
-    // the sysroot crates inherit the host toolchain default.
+
+    // Propagate the target's panic strategy to sysroot crates. Bare-metal
+    // targets almost always want `abort`, and mixing panic strategies
+    // across sysroot rlibs and downstream crates fails at link time:
+    //   error: the crate ... is compiled with a different panic strategy
+    // Emit `-C panic=<s>` before the extra-filename arg so the canonical
+    // token order in args (and therefore the cache hash) stays stable.
+    if let Some(s) = &target.panic_strategy {
+        builder.raw_arg("-C").raw_arg(format!("panic={s}"));
+    }
 
     // compiler_builtins needs two cfgs to build standalone:
     //   * `feature="compiler-builtins"` activates the crate's
@@ -410,6 +412,7 @@ mod tests {
             name: "x86_64-unknown-none".into(),
             spec: "x86_64-unknown-none".into(),
             builtin: true,
+            panic_strategy: None,
             span: None,
         }
     }
