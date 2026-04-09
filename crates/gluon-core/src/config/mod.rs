@@ -8,6 +8,11 @@
 //! interpolates `${OPTION}` references in string-typed values.
 
 mod interpolate;
+pub mod overrides;
 mod resolve;
 
+pub use overrides::{
+    DEFAULT_ENV_PREFIX, DEFAULT_OVERRIDE_FILENAME, load_env_overrides, load_override_file,
+    merge_overrides,
+};
 pub use resolve::resolve;

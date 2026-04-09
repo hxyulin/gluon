@@ -118,6 +118,14 @@ impl RustcCommandBuilder {
     /// emitted as two tokens — `--target` then the path — so that paths
     /// containing `=` characters round-trip correctly.
     ///
+    /// For non-builtin (custom JSON) targets, this also emits
+    /// `-Zunstable-options` immediately before `--target`. rustc requires
+    /// the `-Z` flag whenever `--target` names a JSON file rather than a
+    /// builtin triple. Mirroring cargo's behavior, gluon emits it
+    /// automatically rather than asking the user to remember it. The flag
+    /// is pushed at a deterministic position so
+    /// [`RustcCommandBuilder::hash`] stays stable across runs.
+    ///
     /// One-shot: calling more than once will cause rustc to reject the
     /// invocation.
     pub fn target(&mut self, spec: &str, builtin: bool) -> &mut Self {
@@ -126,6 +134,7 @@ impl RustcCommandBuilder {
             s.push(spec);
             self.args.push(s);
         } else {
+            self.args.push(OsString::from("-Zunstable-options"));
             self.args.push(OsString::from("--target"));
             self.args.push(OsString::from(spec));
         }
@@ -378,10 +387,30 @@ mod tests {
     }
 
     #[test]
-    fn target_custom_spec_is_two_tokens() {
+    fn target_custom_spec_is_two_tokens_with_unstable_options() {
+        // Custom JSON target specs require -Zunstable-options. The flag must
+        // appear immediately before --target so the resulting argv (and the
+        // hash derived from it) is deterministic.
         let mut bld = b("/usr/bin/rustc");
         bld.target("/tmp/specs/custom.json", false);
-        assert_eq!(bld.args(), &[os("--target"), os("/tmp/specs/custom.json")]);
+        assert_eq!(
+            bld.args(),
+            &[
+                os("-Zunstable-options"),
+                os("--target"),
+                os("/tmp/specs/custom.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn target_builtin_does_not_emit_unstable_options() {
+        // Sanity: the -Z flag is *only* added for non-builtin specs. A
+        // builtin triple stays a single token with no extra flags, so we
+        // don't pollute the cache key for the common case.
+        let mut bld = b("/usr/bin/rustc");
+        bld.target("x86_64-unknown-none", true);
+        assert!(!bld.args().iter().any(|a| a == "-Zunstable-options"));
     }
 
     #[test]

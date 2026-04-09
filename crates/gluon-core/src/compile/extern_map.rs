@@ -3,7 +3,7 @@
 //! The scheduler populates this as each crate completes; `compile_crate`
 //! consults it to wire `--extern` flags for the crate's dependencies.
 //!
-//! ### Why [`BTreeMap`] not [`HashMap`]
+//! ### Why [`BTreeMap`] not [`HashMap`](std::collections::HashMap)
 //!
 //! `--extern` flags are pushed onto the rustc argv in the order they are
 //! visited. Using a `BTreeMap` guarantees that iteration order is

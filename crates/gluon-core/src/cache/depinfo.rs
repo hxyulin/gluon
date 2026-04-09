@@ -23,47 +23,58 @@
 //! the failure as [`Error::Config`] so the diagnostic points at the file.
 
 use crate::error::{Error, Result};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Parse a rustc dep-info file and return the prereq paths from its first
 /// target-line.
 ///
 /// See the module docs for the exact subset of Make syntax we recognise.
+///
+/// **Encoding**: the parser operates on raw bytes (`&[u8]`), not on a
+/// Rust `String`. On Unix, file system paths are arbitrary byte
+/// sequences and may not be valid UTF-8 — a project living under
+/// `/home/ülrich/…` would be silently corrupted by an earlier
+/// `read_to_string` + `b as char` pipeline. We construct each `PathBuf`
+/// via [`OsString::from_vec`](std::os::unix::ffi::OsStringExt::from_vec)
+/// on Unix and via UTF-8 validation on Windows (where rustc writes
+/// depfiles in UTF-8 and the OS path encoding is UTF-16, so a UTF-8
+/// round-trip is the only sensible bridge).
 pub fn parse_depfile(path: &Path) -> Result<Vec<PathBuf>> {
-    let text = std::fs::read_to_string(path).map_err(|e| Error::Io {
+    let bytes = std::fs::read(path).map_err(|e| Error::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
 
     // Fold `\<newline>` continuations. We turn each `\<newline>` into a
-    // single space so the resulting string contains one logical line per
+    // single space so the resulting buffer contains one logical line per
     // physical `\n` — which keeps the outer line walker simple.
-    //
-    // We iterate byte-by-byte to avoid UTF-8 boundary headaches; all the
-    // characters we care about (`\`, `\n`, `#`, `:`, space, tab) are ASCII
-    // and safe to match on bytes.
-    let folded = fold_continuations(&text);
+    let folded = fold_continuations(&bytes);
 
-    for (lineno, raw) in folded.lines().enumerate() {
-        let line = raw.trim_start();
-        if line.is_empty() || line.starts_with('#') {
+    let mut lineno = 0usize;
+    for raw in folded.split(|b| *b == b'\n') {
+        lineno += 1;
+        let line = trim_leading_ascii_whitespace(raw);
+        if line.is_empty() || line[0] == b'#' {
             continue;
         }
         // First non-skippable line must be a target-line with `:`.
         let idx = first_unescaped_colon(line).ok_or_else(|| {
-            // Truncate to the first 80 chars so a 4 KB single-line
-            // depfile doesn't drown the diagnostic.
-            let snippet: String = line.chars().take(80).collect();
+            // Truncate to the first 80 bytes so a 4 KB single-line
+            // depfile doesn't drown the diagnostic. We render via
+            // `from_utf8_lossy` because this is a *diagnostic*, not a
+            // path: we'd rather show garbled text than refuse to print.
+            let snippet = String::from_utf8_lossy(&line[..line.len().min(80)]).into_owned();
             Error::Config(format!(
                 "malformed depfile {}: malformed target-line at line {}: \
                  missing `:` separator (line starts with: {:?})",
                 path.display(),
-                lineno + 1,
+                lineno,
                 snippet,
             ))
         })?;
         let prereqs = &line[idx + 1..];
-        return tokenise_prereqs(prereqs, path, lineno + 1);
+        return tokenise_prereqs(prereqs, path, lineno);
     }
 
     Err(Error::Config(format!(
@@ -72,30 +83,40 @@ pub fn parse_depfile(path: &Path) -> Result<Vec<PathBuf>> {
     )))
 }
 
-// TODO(session-B): this parser treats depfile content as ASCII. `read_to_string`
-// already rejects non-UTF-8 input, but a UTF-8 depfile with non-ASCII path
-// components would be corrupted by the per-byte `b as char` conversion here.
-// Fix by tracking byte offsets through the original &[u8] and building
-// PathBufs via OsString::from_vec on unix.
-fn fold_continuations(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
+/// Strip leading ` ` and `\t` bytes. We avoid `str::trim_start` because
+/// the input here is `&[u8]` that may not be valid UTF-8.
+fn trim_leading_ascii_whitespace(line: &[u8]) -> &[u8] {
+    let mut start = 0;
+    while start < line.len() && (line[start] == b' ' || line[start] == b'\t') {
+        start += 1;
+    }
+    // Trim trailing `\r` so a CRLF file doesn't carry the carriage
+    // return into a path token.
+    let mut end = line.len();
+    if end > start && line[end - 1] == b'\r' {
+        end -= 1;
+    }
+    &line[start..end]
+}
+
+fn fold_continuations(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-            out.push(' ');
+            out.push(b' ');
             i += 2;
             continue;
         }
         // Handle `\r\n` continuations too, just to be forgiving of
         // CRLF-normalised checkouts. Not strictly needed for rustc.
         if b == b'\\' && i + 2 < bytes.len() && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
-            out.push(' ');
+            out.push(b' ');
             i += 3;
             continue;
         }
-        out.push(b as char);
+        out.push(b);
         i += 1;
     }
     out
@@ -104,12 +125,11 @@ fn fold_continuations(s: &str) -> String {
 /// Return the index of the first `:` in `line` that is not preceded by an
 /// unescaped backslash. Backslashes can legitimately escape `:` in Make
 /// syntax, though rustc itself doesn't emit escaped colons today.
-fn first_unescaped_colon(line: &str) -> Option<usize> {
-    let bytes = line.as_bytes();
+fn first_unescaped_colon(line: &[u8]) -> Option<usize> {
     let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if i + 1 < bytes.len() => {
+    while i < line.len() {
+        match line[i] {
+            b'\\' if i + 1 < line.len() => {
                 // Skip the escape and the escaped byte.
                 i += 2;
             }
@@ -120,12 +140,12 @@ fn first_unescaped_colon(line: &str) -> Option<usize> {
     None
 }
 
-/// Tokenise a prereq string: split on unescaped whitespace, decoding `\ `
-/// into a literal space.
-fn tokenise_prereqs(s: &str, depfile: &Path, lineno: usize) -> Result<Vec<PathBuf>> {
-    let bytes = s.as_bytes();
+/// Tokenise a prereq byte slice: split on unescaped whitespace, decoding
+/// `\ ` into a literal space, and convert each token into a [`PathBuf`]
+/// preserving the original bytes verbatim.
+fn tokenise_prereqs(bytes: &[u8], depfile: &Path, lineno: usize) -> Result<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = Vec::new();
-    let mut cur = String::new();
+    let mut cur: Vec<u8> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -143,28 +163,58 @@ fn tokenise_prereqs(s: &str, depfile: &Path, lineno: usize) -> Result<Vec<PathBu
                 // `\ ` → space. Any other escape is passed through verbatim
                 // (rustc only emits `\ ` today, but be forgiving).
                 if next == b' ' {
-                    cur.push(' ');
+                    cur.push(b' ');
                 } else {
-                    cur.push(next as char);
+                    cur.push(next);
                 }
                 i += 2;
             }
             b' ' | b'\t' => {
                 if !cur.is_empty() {
-                    out.push(PathBuf::from(std::mem::take(&mut cur)));
+                    out.push(bytes_to_pathbuf(std::mem::take(&mut cur), depfile)?);
                 }
                 i += 1;
             }
             _ => {
-                cur.push(b as char);
+                cur.push(b);
                 i += 1;
             }
         }
     }
     if !cur.is_empty() {
-        out.push(PathBuf::from(cur));
+        out.push(bytes_to_pathbuf(cur, depfile)?);
     }
     Ok(out)
+}
+
+/// Convert a raw byte sequence into a `PathBuf` without going through
+/// `String`.
+///
+/// On Unix the OS path encoding is "arbitrary bytes", so we use
+/// [`OsString::from_vec`](std::os::unix::ffi::OsStringExt::from_vec)
+/// — this preserves bytes that aren't valid UTF-8 (e.g. ISO-8859-1
+/// filesystems, mojibake left over from a migration). On Windows the OS
+/// path encoding is UTF-16; the rustc-written depfile is UTF-8, so we
+/// validate as UTF-8 and let `OsString` perform the WTF-8 → UTF-16
+/// bridge. Invalid UTF-8 on Windows is reported as a config error
+/// rather than silently corrupted, since silently building from a path
+/// that can't be expressed in the OS encoding will fail downstream
+/// anyway.
+#[cfg(unix)]
+fn bytes_to_pathbuf(bytes: Vec<u8>, _depfile: &Path) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn bytes_to_pathbuf(bytes: Vec<u8>, depfile: &Path) -> Result<PathBuf> {
+    let s = String::from_utf8(bytes).map_err(|e| {
+        Error::Config(format!(
+            "malformed depfile {}: prereq path is not valid UTF-8: {e}",
+            depfile.display(),
+        ))
+    })?;
+    Ok(PathBuf::from(OsString::from(s)))
 }
 
 #[cfg(test)]
@@ -265,6 +315,46 @@ mod tests {
             Err(Error::Config(msg)) => assert!(msg.contains("no target-line")),
             other => panic!("expected Error::Config, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn depfile_with_non_ascii_path_round_trips() {
+        // A real-world UTF-8 path under a Unicode-named directory must
+        // round-trip byte-exactly. Before the byte-clean parser this case
+        // got corrupted by a `b as char` cast that truncated multi-byte
+        // codepoints to U+00xx.
+        let (_tmp, p) = write_tmp("out/foo.rlib: /tmp/ülrich/src/main.rs /tmp/a.rs\n");
+        let got = parse_depfile(&p).expect("parse");
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/tmp/ülrich/src/main.rs"),
+                PathBuf::from("/tmp/a.rs"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn depfile_with_non_utf8_path_preserved_on_unix() {
+        // On Unix, paths are arbitrary bytes; rustc may emit a depfile
+        // referencing a path that isn't valid UTF-8 (e.g. an old
+        // ISO-8859-1 filesystem). Make sure those bytes survive the
+        // parser unchanged so the cache lookup matches the actual file.
+        use std::os::unix::ffi::OsStrExt;
+        let mut content = Vec::new();
+        content.extend_from_slice(b"out/foo.rlib: /tmp/");
+        // 0xFF is the canonical "not valid UTF-8" byte.
+        content.push(0xFF);
+        content.extend_from_slice(b"name/main.rs\n");
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("foo.d");
+        std::fs::write(&p, &content).unwrap();
+
+        let got = parse_depfile(&p).expect("parse");
+        assert_eq!(got.len(), 1);
+        let parsed_bytes = got[0].as_os_str().as_bytes();
+        assert_eq!(parsed_bytes, b"/tmp/\xFFname/main.rs");
     }
 
     #[test]

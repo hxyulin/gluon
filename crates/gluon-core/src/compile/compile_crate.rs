@@ -34,6 +34,7 @@ use crate::cache::BuildRecord;
 use crate::compile::{ArtifactMap, CompileCtx, Emit, RustcCommandBuilder};
 use crate::error::{Diagnostic, Error, Result};
 use gluon_model::{BuildModel, CrateDef, CrateType, ResolvedConfig, ResolvedCrateRef};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 /// Input bundle for [`compile`]. Grouped into a struct so the function
@@ -80,6 +81,17 @@ pub(crate) fn build_rustc_command(
     })?;
 
     let crate_name = &crate_def.name;
+    // rustc rejects `-` in `--crate-name`. Cargo silently normalizes
+    // `my-crate` → `my_crate`; we mirror that so cargo-style names in
+    // `gluon.rhai` Just Work. The original `crate_name` is kept for error
+    // messages and cache keys (it's what the user typed). The normalized
+    // form (`crate_name_rustc`) is what we hand to rustc and what we
+    // splice into on-disk filenames so they line up with what rustc
+    // actually writes (rustc derives the filename from `--crate-name` +
+    // `extra-filename`). See `engine::validate` for the post-normalization
+    // collision check that rejects e.g. both `foo-bar` and `foo_bar` in
+    // the same model.
+    let crate_name_rustc = normalize_crate_name(crate_name);
 
     // Resolve the source input file. `CrateDef::path` is a directory path
     // relative to the project root; `CrateDef::root` optionally overrides
@@ -107,7 +119,7 @@ pub(crate) fn build_rustc_command(
     // `cross_final_dir` via `--out-dir`; its canonical name is just
     // `<crate_name>` with no suffix. Dep-info for bins is therefore also
     // suffix-free: `<crate_name>.d` in `cross_final_dir`.
-    let extra_filename = format!("-gluon-{crate_name}");
+    let extra_filename = format!("-gluon-{crate_name_rustc}");
 
     let (out_dir, output_path, depfile_path) = if crate_ref.host {
         // Host crates: output under build/host/<crate>/.
@@ -119,7 +131,7 @@ pub(crate) fn build_rustc_command(
         let artifact = match crate_def.crate_type {
             CrateType::Bin => {
                 // Bins on host are unusual but supported; name has no lib prefix.
-                out_dir.join(format!("{crate_name}{extra_filename}"))
+                out_dir.join(format!("{crate_name_rustc}{extra_filename}"))
             }
             CrateType::ProcMacro => {
                 // Proc-macros produce a .so/.dylib. rustc determines the
@@ -129,7 +141,7 @@ pub(crate) fn build_rustc_command(
                 out_dir.join(format!(
                     "{}{}{}{}",
                     std::env::consts::DLL_PREFIX,
-                    crate_name,
+                    crate_name_rustc,
                     extra_filename,
                     if ext.is_empty() {
                         String::new()
@@ -138,9 +150,9 @@ pub(crate) fn build_rustc_command(
                     }
                 ))
             }
-            _ => out_dir.join(format!("lib{crate_name}{extra_filename}.rlib")),
+            _ => out_dir.join(format!("lib{crate_name_rustc}{extra_filename}.rlib")),
         };
-        let depfile = out_dir.join(format!("{crate_name}{extra_filename}.d"));
+        let depfile = out_dir.join(format!("{crate_name_rustc}{extra_filename}.d"));
         (out_dir, artifact, depfile)
     } else {
         // Cross crates: dispatch on crate type for output location.
@@ -166,18 +178,22 @@ pub(crate) fn build_rustc_command(
                 // The artifact_dir (cross_artifact_dir) is kept for incremental
                 // state; out_dir points to final_dir so the binary lands there.
                 let final_dir = layout.cross_final_dir(target, &resolved.profile);
-                let artifact = final_dir.join(crate_name.as_str());
+                // For binaries, rustc writes the file at exactly
+                // `<--crate-name>` (no `lib` prefix, no extension on
+                // unix). We must therefore look for the *normalized* name
+                // on disk, not the user-typed dashed name.
+                let artifact = final_dir.join(crate_name_rustc.as_ref());
                 // Depfile: without extra-filename, rustc writes `<name>.d`
                 // in the --out-dir (final_dir).
-                let depfile = final_dir.join(format!("{crate_name}.d"));
+                let depfile = final_dir.join(format!("{crate_name_rustc}.d"));
                 // Use final_dir as out_dir so the binary is placed there.
                 // The incremental dir is set separately via -C incremental=.
                 (final_dir, artifact, depfile)
             }
             _ => {
                 let out_dir = layout.cross_artifact_dir(target, &resolved.profile, crate_def);
-                let artifact = out_dir.join(format!("lib{crate_name}{extra_filename}.rlib"));
-                let depfile = out_dir.join(format!("{crate_name}{extra_filename}.d"));
+                let artifact = out_dir.join(format!("lib{crate_name_rustc}{extra_filename}.rlib"));
+                let depfile = out_dir.join(format!("{crate_name_rustc}{extra_filename}.d"));
                 (out_dir, artifact, depfile)
             }
         }
@@ -191,7 +207,7 @@ pub(crate) fn build_rustc_command(
 
     // Crate identity flags.
     builder
-        .crate_name(crate_name)
+        .crate_name(&crate_name_rustc)
         .crate_type(crate_def.crate_type)
         .edition(&crate_def.edition);
 
@@ -496,6 +512,31 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<(PathBu
     )
 }
 
+/// Normalize a user-supplied crate name into the form rustc accepts as
+/// `--crate-name`.
+///
+/// rustc rejects `-` (and a handful of other punctuation) in
+/// `--crate-name`. The cargo convention — and what gluon mirrors — is to
+/// silently rewrite `-` → `_` so that idiomatic dashed names like
+/// `my-kernel-lib` Just Work. Other invalid characters are left alone:
+/// rustc will reject them loudly, which is the correct outcome (the user
+/// has typed something genuinely wrong, not a stylistic choice).
+///
+/// Returns `Cow::Borrowed` for the common no-dash case so we don't pay
+/// for an allocation on every compile.
+///
+/// **Important**: this function is *not* idempotent under
+/// [`sanitise_crate_name`]. They have different goals — sanitise is for
+/// generated identifiers, normalize is for user-typed names. Don't mix
+/// them.
+pub(crate) fn normalize_crate_name(name: &str) -> Cow<'_, str> {
+    if name.contains('-') {
+        Cow::Owned(name.replace('-', "_"))
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
 /// Sanitise an arbitrary string to a valid Rust identifier component.
 ///
 /// Lowercases every character and replaces any byte that is not `[a-z0-9_]`
@@ -652,6 +693,91 @@ mod tests {
     // ---------------------------------------------------------------------------
     // Flag assembly tests
     // ---------------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------------
+    // normalize_crate_name
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn normalize_crate_name_passes_through_clean_names() {
+        // No dash → borrowed (no allocation, identity).
+        let n = normalize_crate_name("foo_bar");
+        assert_eq!(n, "foo_bar");
+        assert!(matches!(n, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn normalize_crate_name_replaces_dashes_with_underscores() {
+        let n = normalize_crate_name("my-kernel-lib");
+        assert_eq!(n, "my_kernel_lib");
+        assert!(matches!(n, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn normalize_crate_name_leaves_other_invalid_chars_for_rustc_to_reject() {
+        // Only `-` is normalized. `.` is left alone — rustc will reject it
+        // loudly, which is the right outcome (the user typed something
+        // genuinely wrong, not a stylistic dash).
+        let n = normalize_crate_name("foo.bar");
+        assert_eq!(n, "foo.bar");
+    }
+
+    #[test]
+    fn flag_assembly_dash_named_crate_normalizes_for_rustc_and_filenames() {
+        // End-to-end: a CrateDef named `my-lib` must reach rustc as
+        // `--crate-name my_lib`, and the predicted output `.rlib` filename
+        // must use the normalized name (since rustc derives the filename
+        // from `--crate-name`).
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = make_ctx(tmp.path(), "/usr/bin/rustc");
+        let sysroot_dir = tmp.path().join("sysroot");
+
+        let mut model = BuildModel::default();
+        let th = insert_target(&mut model, make_target("x86", "x86_64-unknown-none", true));
+        let ch = insert_crate(
+            &mut model,
+            CrateDef {
+                name: "my-lib".into(),
+                path: "crates/my-lib".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Lib,
+                ..Default::default()
+            },
+        );
+        let resolved = make_resolved(th, tmp.path().to_path_buf());
+        let crate_ref = cross_ref(ch, th);
+        let artifacts = ArtifactMap::new();
+
+        let (builder, output_path, depfile_path) = build_rustc_command(
+            &ctx,
+            &CompileCrateInput {
+                model: &model,
+                resolved: &resolved,
+                crate_ref: &crate_ref,
+                artifacts: &artifacts,
+                sysroot_dir: Some(&sysroot_dir),
+            },
+        )
+        .unwrap();
+
+        let args = args_as_strings(&builder);
+        // The user-typed `my-lib` must NOT appear as the value of
+        // `--crate-name` (rustc would reject it). It also must not appear
+        // in `extra-filename`, since rustc embeds that into the actual
+        // filename via `--crate-name`-derived rules.
+        let crate_name_pos = args
+            .iter()
+            .position(|a| a == "--crate-name")
+            .expect("--crate-name flag missing");
+        assert_eq!(args[crate_name_pos + 1], "my_lib");
+
+        // The predicted output filename must match what rustc will write:
+        // `lib<NORMALIZED>-gluon-<NORMALIZED>.rlib`.
+        let output_name = output_path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(output_name, "libmy_lib-gluon-my_lib.rlib");
+        let dep_name = depfile_path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(dep_name, "my_lib-gluon-my_lib.d");
+    }
 
     #[test]
     fn flag_assembly_host_crate_has_no_sysroot_or_target() {

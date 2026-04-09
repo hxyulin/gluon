@@ -34,7 +34,7 @@ use std::path::Path;
 /// a bottleneck, revisit.
 const SHA256_CHUNK: usize = 64 * 1024;
 
-/// Thin wrapper over [`sha2::Sha256::digest`] returning a plain `[u8; 32]`.
+/// Thin wrapper over `sha2::Sha256::digest` returning a plain `[u8; 32]`.
 pub fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }

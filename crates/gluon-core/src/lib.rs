@@ -18,12 +18,11 @@ pub mod rule;
 pub mod scheduler;
 pub mod sysroot;
 
-pub use cache::{BuildRecord, Cache, CacheManifest, FreshnessQuery};
+pub use cache::{BuildRecord, Cache, CacheLock, CacheManifest, FreshnessQuery};
 pub use compile::{
     ArtifactMap, BuildLayout, CompileCrateInput, CompileCtx, Emit, RustcCommandBuilder, RustcInfo,
     compile_crate,
 };
-pub use engine::evaluate_script;
 pub use error::{Diagnostic, Error, Level, Result};
 pub use project_root::find_project_root;
 pub use rule::builtin::ExecRule;
@@ -44,11 +43,9 @@ use std::path::Path;
 /// Parse and evaluate a `gluon.rhai` file at `path`, returning the
 /// resulting [`BuildModel`].
 ///
-/// Thin wrapper around [`engine::evaluate_script`] — exists so that
-/// embedders can `use gluon_core::evaluate;` for a clean top-level API
-/// without reaching into the `engine` module. See [`engine::evaluate_script`]
-/// for the lower-level entry point that also returns accumulated
-/// diagnostics.
+/// This is the canonical top-level entry point for parsing gluon scripts.
+/// Embedders that also want the accumulated non-fatal diagnostics can
+/// reach into [`engine::evaluate_script_raw`].
 pub fn evaluate(path: &Path) -> Result<BuildModel> {
     engine::evaluate_script(path)
 }
@@ -79,16 +76,47 @@ pub fn resolve_config(
 ///
 /// Uses the default set of built-in rules (`RuleRegistry::with_builtins`)
 /// and the host's parallelism from `std::thread::available_parallelism`
-/// (fallback 1).
+/// (fallback 1). Callers that need to pin the worker count (CI
+/// reproducibility, scheduler debugging, `-j` from the CLI) should use
+/// [`build_with_workers`] instead.
 pub fn build(
     ctx: &CompileCtx,
     model: &BuildModel,
     resolved: &ResolvedConfig,
 ) -> Result<BuildSummary> {
-    let rules = rule::RuleRegistry::with_builtins();
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
+    build_with_workers(ctx, model, resolved, workers)
+}
+
+/// Like [`build`], but pins the worker count instead of probing the host.
+///
+/// `workers` must be ≥ 1. The CLI's `-j/--jobs` flag is validated at
+/// parse time so this assertion only fires on programmatic misuse.
+///
+/// Use this when:
+/// - the CLI user passed `-j N` and expects exactly N workers,
+/// - a CI run needs deterministic interleaving (e.g. `-j 1` for stable
+///   stdout in golden tests),
+/// - you're debugging a scheduler issue and want to bisect parallelism.
+pub fn build_with_workers(
+    ctx: &CompileCtx,
+    model: &BuildModel,
+    resolved: &ResolvedConfig,
+    workers: usize,
+) -> Result<BuildSummary> {
+    assert!(workers >= 1, "build_with_workers requires workers >= 1");
+
+    // Cross-process lock around the cache manifest. Held for the entire
+    // build so concurrent `gluon build` invocations in the same project
+    // serialise instead of clobbering each other's freshness records.
+    // Released by drop after the final `cache.save()` below — the guard
+    // is intentionally bound to a name so it lives until the end of the
+    // function. See `cache::lock` for the rationale.
+    let _cache_guard = CacheLock::acquire(&ctx.layout)?;
+
+    let rules = rule::RuleRegistry::with_builtins();
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
     let summary = scheduler::execute_pipeline(
@@ -128,6 +156,12 @@ pub fn clean(layout: &BuildLayout, keep_sysroot: bool) -> Result<()> {
     if !root.exists() {
         return Ok(());
     }
+
+    // Hold the same lock that `build` takes, for the same reason: a
+    // clean racing an in-flight build could `rm -rf` files the builder
+    // is in the middle of writing. Acquire after the existence check so
+    // we don't create a build dir on a no-op clean.
+    let _cache_guard = CacheLock::acquire(layout)?;
 
     if !keep_sysroot {
         match std::fs::remove_dir_all(root) {

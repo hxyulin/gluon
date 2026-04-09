@@ -9,7 +9,7 @@
 //! ### Fast path vs slow path
 //!
 //! A stamp file (`<sysroot>/stamp`) records the hex-encoded
-//! [`RustcInfo::version_hash`] of the toolchain that most recently
+//! [`RustcInfo::version_hash`](crate::compile::RustcInfo::version_hash) of the toolchain that most recently
 //! populated the sysroot. On entry we read that stamp:
 //!
 //! - **Fast path.** If the stamp exists and matches the current rustc's

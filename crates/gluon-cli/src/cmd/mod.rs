@@ -1,14 +1,25 @@
 //! Shared command context and plumbing for `gluon-cli` subcommands.
 //!
-//! Each subcommand (`build`, `clean`, `configure`) needs the same set of
-//! preamble work: walk up from the current directory to find a
-//! `gluon.rhai`, evaluate it, pick a profile, resolve the config, probe
-//! rustc, load the cache manifest, and construct a `CompileCtx`. That
-//! work lives here in [`build_context_at`] so each subcommand module can
-//! stay focused on the *action* rather than the *setup*.
+//! Each subcommand needs some subset of the same preamble work: walk
+//! up from the current directory to find a `gluon.rhai`, evaluate it,
+//! pick a profile, resolve the config, probe rustc, load the cache
+//! manifest, and construct a `CompileCtx`. Two entry points are
+//! provided here:
 //!
-//! `build_context_at(cwd, ...)` takes the working directory explicitly
-//! so unit tests can exercise the full wiring against a tempdir without
+//! - [`build_context_at`] does the full wiring including the rustc
+//!   probe. Used by `build` and `configure`, both of which genuinely
+//!   need rustc metadata (for sysroot compilation and for the
+//!   analyzer's `rust_src` field respectively).
+//!
+//! - [`build_layout_context_at`] stops just before the rustc probe
+//!   and returns only the layout + project root. Used by `clean`,
+//!   which only needs to know where `build/` lives. This is
+//!   important: `clean` is the subcommand users reach for when their
+//!   toolchain is broken, so forcing a rustc probe would make the
+//!   tool useless in exactly that situation.
+//!
+//! Both `_at` variants take the working directory explicitly so unit
+//! tests can exercise the full wiring against a tempdir without
 //! mutating process-wide `current_dir`. The public [`build_context`]
 //! wrapper reads the real cwd and delegates.
 
@@ -18,6 +29,10 @@ pub mod configure;
 pub mod external;
 
 use anyhow::{Context, Result};
+use gluon_core::config::{
+    DEFAULT_ENV_PREFIX, DEFAULT_OVERRIDE_FILENAME, load_env_overrides, load_override_file,
+    merge_overrides,
+};
 use gluon_core::model::{BuildModel, ResolvedConfig};
 use gluon_core::{
     BuildLayout, Cache, CompileCtx, RustcInfo, evaluate, find_project_root, resolve_config,
@@ -51,9 +66,13 @@ pub struct CmdContext {
 
 /// Build a [`CmdContext`] by walking up from the host's current
 /// directory. Thin wrapper around [`build_context_at`].
-pub fn build_context(profile: Option<&str>, target: Option<&str>) -> Result<CmdContext> {
+pub fn build_context(
+    profile: Option<&str>,
+    target: Option<&str>,
+    config_file: Option<&Path>,
+) -> Result<CmdContext> {
     let cwd = std::env::current_dir().context("failed to read current directory")?;
-    build_context_at(&cwd, profile, target)
+    build_context_at(&cwd, profile, target, config_file)
 }
 
 /// Build a [`CmdContext`] starting the project-root search at `cwd`.
@@ -65,7 +84,54 @@ pub fn build_context_at(
     cwd: &Path,
     profile: Option<&str>,
     target: Option<&str>,
+    config_file: Option<&Path>,
 ) -> Result<CmdContext> {
+    let LayoutContext {
+        model,
+        resolved,
+        layout,
+        project_root,
+    } = build_layout_context_at(cwd, profile, target, config_file)?;
+
+    let rustc_info = Arc::new(
+        RustcInfo::load_or_probe(&layout).context("failed to load or probe rustc metadata")?,
+    );
+    let cache = Cache::load(layout.cache_manifest()).context("failed to load cache manifest")?;
+    let ctx = CompileCtx::new(layout, rustc_info, cache);
+
+    Ok(CmdContext {
+        model,
+        resolved,
+        ctx,
+        project_root,
+    })
+}
+
+/// Lighter-weight context used by subcommands that don't need rustc.
+///
+/// Contains everything up to and including the resolved config and
+/// build layout, but not a [`CompileCtx`] — that would force a rustc
+/// probe, which is exactly what we want to avoid for `clean`.
+pub struct LayoutContext {
+    pub model: BuildModel,
+    pub resolved: ResolvedConfig,
+    pub layout: BuildLayout,
+    pub project_root: PathBuf,
+}
+
+/// Build a [`LayoutContext`] (no rustc probe) starting at `cwd`.
+///
+/// Used by `clean` so that a user with a broken or missing toolchain
+/// can still wipe the build directory. `build` and `configure` go
+/// through [`build_context_at`] instead because they need the rustc
+/// probe — `build` for sysroot compilation, `configure` for the
+/// analyzer's `rust_src` field.
+pub fn build_layout_context_at(
+    cwd: &Path,
+    profile: Option<&str>,
+    target: Option<&str>,
+    config_file: Option<&Path>,
+) -> Result<LayoutContext> {
     let project_root = find_project_root(cwd)
         .context("could not find a gluon.rhai in the current directory or any parent")?;
     let script = project_root.join("gluon.rhai");
@@ -93,22 +159,65 @@ pub fn build_context_at(
         }
     };
 
-    let resolved = resolve_config(&model, profile_name, target, &project_root, None)
+    // Per-checkout overrides: load the file (CLI flag → explicit path,
+    // otherwise the default `<root>/.gluon-config` if present), then
+    // layer environment variables on top. An absent default file is not
+    // an error; an absent *explicit* file is. Env beats file on
+    // conflicts (see `config::overrides::merge_overrides`).
+    let overrides = {
+        let file_path = match config_file {
+            Some(p) => Some(p.to_path_buf()),
+            None => {
+                let default = project_root.join(DEFAULT_OVERRIDE_FILENAME);
+                if default.exists() {
+                    Some(default)
+                } else {
+                    None
+                }
+            }
+        };
+        let file_overrides = match &file_path {
+            Some(p) => {
+                if config_file.is_some() && !p.exists() {
+                    return Err(anyhow::anyhow!(
+                        "config override file {} does not exist",
+                        p.display()
+                    ));
+                }
+                load_override_file(p).context("failed to read config override file")?
+            }
+            None => Default::default(),
+        };
+        let env_overrides = load_env_overrides(DEFAULT_ENV_PREFIX);
+        merge_overrides(file_overrides, env_overrides)
+    };
+
+    let overrides_arg = if overrides.is_empty() {
+        None
+    } else {
+        Some(&overrides)
+    };
+    let resolved = resolve_config(&model, profile_name, target, &project_root, overrides_arg)
         .context("failed to resolve config")?;
 
     let layout = BuildLayout::new(project_root.join("build"), &resolved.project.name);
-    let rustc_info = Arc::new(
-        RustcInfo::load_or_probe(&layout).context("failed to load or probe rustc metadata")?,
-    );
-    let cache = Cache::load(layout.cache_manifest()).context("failed to load cache manifest")?;
-    let ctx = CompileCtx::new(layout, rustc_info, cache);
 
-    Ok(CmdContext {
+    Ok(LayoutContext {
         model,
         resolved,
-        ctx,
+        layout,
         project_root,
     })
+}
+
+/// Thin wrapper around [`build_layout_context_at`] that reads cwd.
+pub fn build_layout_context(
+    profile: Option<&str>,
+    target: Option<&str>,
+    config_file: Option<&Path>,
+) -> Result<LayoutContext> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    build_layout_context_at(&cwd, profile, target, config_file)
 }
 
 /// Return the first profile name defined in the model, or `None` if the
@@ -153,7 +262,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_min_script(tmp.path());
 
-        let cmd = build_context_at(tmp.path(), None, None).expect("build_context_at");
+        let cmd = build_context_at(tmp.path(), None, None, None).expect("build_context_at");
         assert_eq!(cmd.resolved.project.name, "demo");
         assert_eq!(cmd.resolved.profile.name, "dev");
         // project_root should be the tempdir (canonicalized by find_project_root).
@@ -178,7 +287,7 @@ mod tests {
             profile("alpha").target("x86_64-unknown-none");
         "#;
         fs::write(tmp.path().join("gluon.rhai"), script).expect("write");
-        let cmd = build_context_at(tmp.path(), None, None).expect("build_context_at");
+        let cmd = build_context_at(tmp.path(), None, None, None).expect("build_context_at");
         assert_eq!(cmd.resolved.profile.name, "alpha");
     }
 }

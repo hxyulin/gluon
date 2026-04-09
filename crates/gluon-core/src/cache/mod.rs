@@ -41,10 +41,12 @@
 
 pub mod depinfo;
 pub mod hash;
+pub mod lock;
 pub mod manifest;
 
 pub use depinfo::parse_depfile;
 pub use hash::{hash_argv, sha256_bytes, sha256_file};
+pub use lock::CacheLock;
 pub use manifest::{CacheEntry, CacheManifest, FileFingerprint};
 
 use crate::error::{Error, Result};

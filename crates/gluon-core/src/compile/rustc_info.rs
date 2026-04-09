@@ -128,14 +128,18 @@ impl RustcInfo {
         let sysroot = PathBuf::from(sysroot_raw.trim());
 
         // 3. Derive the absolute rustc path. Honour $RUSTC when it's
-        //    already absolute; otherwise use `<sysroot>/bin/rustc`.
-        //    TODO(windows): append `.exe` on Windows hosts.
+        //    already absolute; otherwise use `<sysroot>/bin/<rustc-bin>`.
+        //    On Windows the binary is `rustc.exe`; everywhere else it's
+        //    plain `rustc`. We only adjust the *fallback* — when the user
+        //    set `$RUSTC` to an absolute path, we trust them to have
+        //    included the `.exe` if needed (cargo behaves the same way).
+        const RUSTC_BIN: &str = if cfg!(windows) { "rustc.exe" } else { "rustc" };
         let rustc_path = {
             let p = PathBuf::from(rustc_cmd);
             if p.is_absolute() {
                 p
             } else {
-                sysroot.join("bin").join("rustc")
+                sysroot.join("bin").join(RUSTC_BIN)
             }
         };
 

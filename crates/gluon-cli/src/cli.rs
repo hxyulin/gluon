@@ -13,6 +13,17 @@ use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+/// Parse `-j/--jobs`. Rejects zero with a friendly message instead of
+/// the numeric-overflow noise rustc would produce later in the
+/// scheduler.
+fn parse_jobs(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|_| format!("'{s}' is not a number"))?;
+    if n == 0 {
+        return Err("must be at least 1 (use no -j flag for the default)".into());
+    }
+    Ok(n)
+}
+
 /// Top-level `gluon` command-line interface.
 #[derive(Parser, Debug)]
 #[command(name = "gluon", version, about = "Bare-metal Rust kernel build system")]
@@ -25,8 +36,21 @@ pub struct Cli {
     #[arg(short = 't', long, global = true)]
     pub target: Option<String>,
 
+    /// Override file with `KEY = value` entries (defaults to
+    /// `<project_root>/.gluon-config` when present).
+    ///
+    /// Values from this file are merged on top of the defaults declared
+    /// in `gluon.rhai`. Environment variables prefixed `GLUON_` win over
+    /// the file. See `gluon_core::config::overrides` for the grammar.
+    #[arg(short = 'C', long = "config-file", global = true)]
+    pub config_file: Option<PathBuf>,
+
     /// Number of parallel compile jobs (defaults to available parallelism).
-    #[arg(short = 'j', long, global = true)]
+    ///
+    /// Must be at least 1; clap rejects `-j 0` at parse time via
+    /// [`parse_jobs`] so the scheduler never sees a worker count that
+    /// would deadlock the ready queue.
+    #[arg(short = 'j', long, global = true, value_parser = parse_jobs)]
     pub jobs: Option<usize>,
 
     /// Emit more verbose output.
@@ -158,6 +182,28 @@ mod tests {
     fn parses_jobs_flag() {
         let cli = Cli::try_parse_from(["gluon", "-j", "4", "build"]).expect("parse");
         assert_eq!(cli.jobs, Some(4));
+    }
+
+    #[test]
+    fn rejects_jobs_zero() {
+        // -j 0 is meaningless and would deadlock the scheduler. Rejected
+        // at parse time so the user gets a friendly error instead of a
+        // confusing scheduler stall.
+        let err =
+            Cli::try_parse_from(["gluon", "-j", "0", "build"]).expect_err("-j 0 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("at least 1"),
+            "error must explain the constraint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_jobs_non_numeric() {
+        let err = Cli::try_parse_from(["gluon", "-j", "abc", "build"])
+            .expect_err("-j abc must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not a number"), "got: {msg}");
     }
 
     #[test]
