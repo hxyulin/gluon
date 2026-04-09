@@ -31,7 +31,6 @@
 //! supported configuration.
 
 use gluon_model::CrateType;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -280,54 +279,11 @@ impl RustcCommandBuilder {
     /// inputs — a Unix/Windows shared build cache is not supported today.
     /// See the module-level docs for the full caveat.
     pub fn hash(&self) -> [u8; 32] {
-        hash_argv(&self.rustc, &self.args, &self.env, self.cwd.as_deref())
+        // Delegate to the canonical implementation in `cache::hash`. The
+        // algorithm was moved there in chunk A3 so both the cache layer
+        // and the builder share one byte-for-byte identical digest.
+        crate::cache::hash::hash_argv(&self.rustc, &self.args, &self.env, self.cwd.as_deref())
     }
-}
-
-// TODO(chunk-A3): move to cache::hash::hash_argv
-fn hash_argv(
-    rustc: &Path,
-    args: &[OsString],
-    env: &BTreeMap<OsString, OsString>,
-    cwd: Option<&Path>,
-) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"gluon.rustc.v1\0");
-
-    let rustc_bytes = rustc.as_os_str().as_encoded_bytes();
-    hasher.update((rustc_bytes.len() as u64).to_le_bytes());
-    hasher.update(rustc_bytes);
-
-    hasher.update((args.len() as u64).to_le_bytes());
-    for arg in args {
-        let bytes = arg.as_encoded_bytes();
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    }
-
-    hasher.update((env.len() as u64).to_le_bytes());
-    for (k, v) in env {
-        let kb = k.as_encoded_bytes();
-        let vb = v.as_encoded_bytes();
-        hasher.update((kb.len() as u64).to_le_bytes());
-        hasher.update(kb);
-        hasher.update((vb.len() as u64).to_le_bytes());
-        hasher.update(vb);
-    }
-
-    match cwd {
-        Some(p) => {
-            hasher.update([1u8]);
-            let bytes = p.as_os_str().as_encoded_bytes();
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes);
-        }
-        None => {
-            hasher.update([0u8]);
-        }
-    }
-
-    hasher.finalize().into()
 }
 
 #[cfg(test)]
@@ -565,6 +521,37 @@ mod tests {
     fn extern_crate_debug_asserts_on_equals_in_name() {
         let mut bld = b("/usr/bin/rustc");
         bld.extern_crate("bad=name", Path::new("/tmp/lib.rlib"));
+    }
+
+    /// Locks in the chunk A3 migration: `RustcCommandBuilder::hash()` must
+    /// produce byte-for-byte the same digest as calling
+    /// `cache::hash::hash_argv` directly with the builder's fields. If
+    /// this ever drifts, every on-disk cache would silently invalidate.
+    #[test]
+    fn hash_matches_cache_hash_argv_delegation() {
+        let mut bld = b("/usr/bin/rustc");
+        bld.crate_name("k")
+            .crate_type(CrateType::Lib)
+            .edition("2024")
+            .target("x86_64-unknown-none", true)
+            .cfg("foo")
+            .env("CARGO", "/bin/cargo")
+            .cwd("/tmp");
+
+        let builder_hash = bld.hash();
+
+        // Mirror the builder's fields into the free function. We pull
+        // them out of the builder via its accessors where possible; the
+        // rest we reconstruct exactly as the setters above did.
+        let mut env: BTreeMap<OsString, OsString> = BTreeMap::new();
+        env.insert(OsString::from("CARGO"), OsString::from("/bin/cargo"));
+        let direct_hash = crate::cache::hash::hash_argv(
+            bld.rustc_path(),
+            bld.args(),
+            &env,
+            Some(Path::new("/tmp")),
+        );
+        assert_eq!(builder_hash, direct_hash);
     }
 
     #[test]

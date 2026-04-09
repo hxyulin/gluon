@@ -5,11 +5,13 @@
 //! engine, scheduler, compile, cache, and sysroot modules will be added
 //! in subsequent implementation chunks.
 
+pub mod cache;
 pub mod compile;
 pub mod config;
 pub mod engine;
 pub mod error;
 
+pub use cache::{BuildRecord, Cache, CacheManifest, FreshnessQuery};
 pub use compile::{BuildLayout, Emit, RustcCommandBuilder, RustcInfo};
 pub use config::resolve;
 pub use engine::evaluate_script;
