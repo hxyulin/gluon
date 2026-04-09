@@ -17,6 +17,7 @@ pub mod fmt;
 pub mod kconfig;
 pub mod project_root;
 pub mod rule;
+pub mod run;
 pub mod scheduler;
 pub mod sysroot;
 pub mod vendor;
@@ -30,6 +31,7 @@ pub use error::{Diagnostic, Error, Level, Result};
 pub use project_root::find_project_root;
 pub use rule::builtin::ExecRule;
 pub use rule::{RuleCtx, RuleFn, RuleRegistry};
+pub use run::{RunOptions, run};
 pub use scheduler::{
     BuildSummary, Dag, DagNode, JobDispatcher, NodeId, WorkerPool, build_dag, execute_pipeline,
 };
@@ -446,6 +448,7 @@ mod tests {
                 config_crate_name: None,
                 cfg_prefix: None,
                 config_override_file: None,
+                default_profile: None,
             },
             profile: ResolvedProfile {
                 name: "dev".into(),
@@ -454,6 +457,10 @@ mod tests {
                 debug_info: false,
                 lto: None,
                 boot_binary: None,
+                qemu_memory: None,
+                qemu_cores: None,
+                qemu_extra_args: Vec::new(),
+                test_timeout: None,
             },
             options: BTreeMap::new(),
             crates: Vec::new(),
@@ -509,6 +516,7 @@ mod tests {
                 config_crate_name: None,
                 cfg_prefix: None,
                 config_override_file: None,
+                default_profile: None,
             },
             profile: ResolvedProfile {
                 name: "dev".into(),
@@ -517,6 +525,10 @@ mod tests {
                 debug_info: false,
                 lto: None,
                 boot_binary: None,
+                qemu_memory: None,
+                qemu_cores: None,
+                qemu_extra_args: Vec::new(),
+                test_timeout: None,
             },
             options: BTreeMap::new(),
             crates: Vec::new(),

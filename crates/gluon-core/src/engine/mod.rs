@@ -528,25 +528,85 @@ mod tests {
     }
 
     #[test]
-    fn qemu_stub() {
+    fn qemu_typed_fields() {
         let f = write_script(
             r#"
             project("t", "0.1.0");
-            qemu().machine("q35").memory(512).cores(4);
+            qemu("qemu-system-x86_64")
+                .machine("q35")
+                .memory(512)
+                .cores(4)
+                .serial_stdio()
+                .extra_args(["-display", "none"])
+                .boot_mode("uefi")
+                .ovmf_code("/opt/ovmf/CODE.fd")
+                .ovmf_vars("/opt/ovmf/VARS.fd")
+                .esp_dir("./build/esp");
             "#,
         );
         let model = evaluate_script(f.path()).expect("script must evaluate");
+        assert_eq!(model.qemu.binary.as_deref(), Some("qemu-system-x86_64"));
+        assert_eq!(model.qemu.machine.as_deref(), Some("q35"));
+        assert_eq!(model.qemu.memory_mb, Some(512));
+        assert_eq!(model.qemu.cores, Some(4));
+        assert_eq!(model.qemu.serial, Some(gluon_model::SerialMode::Stdio));
         assert_eq!(
-            model.qemu.extras.get("machine").map(String::as_str),
-            Some("q35")
+            model.qemu.extra_args,
+            vec!["-display".to_string(), "none".to_string()]
+        );
+        assert_eq!(model.qemu.boot_mode, Some(gluon_model::BootMode::Uefi));
+        assert_eq!(
+            model.qemu.ovmf_code.as_deref(),
+            Some(std::path::Path::new("/opt/ovmf/CODE.fd"))
         );
         assert_eq!(
-            model.qemu.extras.get("memory").map(String::as_str),
-            Some("512")
+            model.qemu.ovmf_vars.as_deref(),
+            Some(std::path::Path::new("/opt/ovmf/VARS.fd"))
         );
         assert_eq!(
-            model.qemu.extras.get("cores").map(String::as_str),
-            Some("4")
+            model.qemu.esp,
+            Some(gluon_model::EspSource::Dir(std::path::PathBuf::from(
+                "./build/esp"
+            )))
+        );
+    }
+
+    #[test]
+    fn qemu_boot_mode_invalid_diagnoses() {
+        let f = write_script(
+            r#"
+            project("t", "0.1.0");
+            qemu().boot_mode("legacy");
+            "#,
+        );
+        let (_, diags) = evaluate_script_raw(f.path()).expect("script runs");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("boot_mode") && d.message.contains("legacy")),
+            "expected boot_mode diagnostic, got: {diags:#?}"
+        );
+    }
+
+    #[test]
+    fn qemu_esp_mutually_exclusive() {
+        let f = write_script(
+            r#"
+            project("t", "0.1.0");
+            qemu().esp_dir("a").esp_image("b.img");
+            "#,
+        );
+        let (model, diags) = evaluate_script_raw(f.path()).expect("script runs");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("esp_dir") && d.message.contains("esp_image")),
+            "expected esp mutual-exclusion diagnostic, got: {diags:#?}"
+        );
+        // First call wins.
+        assert_eq!(
+            model.qemu.esp,
+            Some(gluon_model::EspSource::Dir(std::path::PathBuf::from("a")))
         );
     }
 
@@ -579,7 +639,7 @@ mod tests {
             "expected duplicate qemu diagnostic, got: {diags:#?}"
         );
         assert_eq!(
-            model.qemu.extras.get("machine").map(String::as_str),
+            model.qemu.machine.as_deref(),
             Some("q35"),
             "first qemu definition's machine should be preserved"
         );

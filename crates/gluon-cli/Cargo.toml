@@ -11,6 +11,15 @@ description = "Command-line interface for the Gluon build system."
 name = "gluon"
 path = "src/main.rs"
 
+# Test-only stand-in for `qemu-system-*`. Used by integration tests
+# in `tests/run_integration.rs` to exercise the spawn path of
+# `gluon run` without needing real QEMU installed. The binary itself
+# lives in `src/bin/fake_qemu.rs`; cargo exposes its path to tests
+# via the `CARGO_BIN_EXE_fake-qemu` env var.
+[[bin]]
+name = "fake-qemu"
+path = "src/bin/fake_qemu.rs"
+
 [dependencies]
 gluon-core.workspace = true
 clap = { version = "4", features = ["derive"] }

@@ -25,7 +25,20 @@ pub struct ResolvedProfile {
     pub debug_info: bool,
     pub lto: Option<String>,
     pub boot_binary: Option<Handle<CrateDef>>,
-    // Leave profile extras minimal — later chunks add qemu/preset/etc. when they need them.
+    /// Profile-level QEMU memory override (MiB). Takes precedence over
+    /// `QemuDef::memory_mb` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qemu_memory: Option<u32>,
+    /// Profile-level QEMU core count override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qemu_cores: Option<u32>,
+    /// Extra QEMU args contributed by the profile; appended after
+    /// `QemuDef::extra_args`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qemu_extra_args: Vec<String>,
+    /// Profile-level timeout (seconds) for `gluon run`/`test` invocations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_timeout: Option<u32>,
 }
 
 /// A crate selected for inclusion in the build, with resolved target binding.

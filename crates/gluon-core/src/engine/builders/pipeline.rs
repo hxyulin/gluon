@@ -4,8 +4,11 @@ use super::builder_method;
 use crate::engine::EngineState;
 use crate::engine::conversions::array_to_string_vec;
 use crate::error::Diagnostic;
-use gluon_model::{PipelineDef, PipelineStep, RuleDef, RuleHandler};
+use gluon_model::{
+    BootMode, EspSource, PipelineDef, PipelineStep, RuleDef, RuleHandler, SerialMode,
+};
 use rhai::{Dynamic, Engine, NativeCallContext, Position};
+use std::path::PathBuf;
 
 /// Default name for the project-level singleton pipeline. The script calls
 /// `pipeline()` with no arguments and implicitly refers to this one.
@@ -37,9 +40,8 @@ pub struct PipelineBuilder {
     is_duplicate: bool,
 }
 
-/// Chainable builder returned by `qemu()`. Stub: all values are stored in
-/// [`gluon_model::QemuDef::extras`] as stringified entries for later
-/// consumption.
+/// Chainable builder returned by `qemu()`. Mutates
+/// [`gluon_model::QemuDef`] through typed field setters.
 #[derive(Clone)]
 pub struct QemuBuilder {
     state: EngineState,
@@ -290,34 +292,37 @@ fn register_pipeline(engine: &mut Engine, state: EngineState) {
 }
 
 // ---------------------------------------------------------------------------
-// qemu() — stub, stores values in QemuDef.extras
+// qemu() — typed builder, mutates gluon_model::QemuDef directly.
 // ---------------------------------------------------------------------------
 
 fn register_qemu(engine: &mut Engine, state: EngineState) {
     let s = state;
+
+    // qemu() with no args — binary stays None, filled in at resolve time.
+    let s1 = s.clone();
     engine.register_fn("qemu", move |ctx: NativeCallContext| -> QemuBuilder {
-        let pos = ctx.call_position();
-        let span = s.span_from(pos);
-        let mut defined = s.qemu_defined.borrow_mut();
-        let is_duplicate = *defined;
-        if is_duplicate {
-            s.push_diagnostic(
-                Diagnostic::error("qemu is defined more than once".to_string()).with_span(span),
-            );
-        } else {
-            *defined = true;
-        }
-        QemuBuilder {
-            state: s.clone(),
-            pos,
-            is_duplicate,
-        }
+        start_qemu(&s1, ctx.call_position(), None)
     });
 
-    fn set_extra(builder: &QemuBuilder, key: &str, val: String) {
-        let mut model = builder.state.model.borrow_mut();
-        model.qemu.extras.insert(key.into(), val);
-    }
+    // qemu("qemu-system-x86_64") — binary set up front.
+    let s2 = s.clone();
+    engine.register_fn(
+        "qemu",
+        move |ctx: NativeCallContext, binary: &str| -> QemuBuilder {
+            start_qemu(&s2, ctx.call_position(), Some(binary.into()))
+        },
+    );
+
+    engine.register_fn(
+        "binary",
+        |builder: &mut QemuBuilder, binary: &str| -> QemuBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            with_qemu(builder, |q| q.binary = Some(binary.into()));
+            builder.clone()
+        },
+    );
 
     engine.register_fn(
         "machine",
@@ -325,50 +330,65 @@ fn register_qemu(engine: &mut Engine, state: EngineState) {
             if builder.is_duplicate {
                 return builder.clone();
             }
-            set_extra(builder, "machine", machine.into());
+            with_qemu(builder, |q| q.machine = Some(machine.into()));
             builder.clone()
         },
     );
+
     engine.register_fn(
         "memory",
         |builder: &mut QemuBuilder, mb: i64| -> QemuBuilder {
             if builder.is_duplicate {
                 return builder.clone();
             }
-            set_extra(builder, "memory", mb.to_string());
+            if let Some(v) = clamp_u32(mb, "memory", builder) {
+                with_qemu(builder, |q| q.memory_mb = Some(v));
+            }
             builder.clone()
         },
     );
+
     engine.register_fn(
         "cores",
         |builder: &mut QemuBuilder, n: i64| -> QemuBuilder {
             if builder.is_duplicate {
                 return builder.clone();
             }
-            set_extra(builder, "cores", n.to_string());
+            if let Some(v) = clamp_u32(n, "cores", builder) {
+                with_qemu(builder, |q| q.cores = Some(v));
+            }
             builder.clone()
         },
     );
+
+    engine.register_fn("serial_stdio", |builder: &mut QemuBuilder| -> QemuBuilder {
+        if builder.is_duplicate {
+            return builder.clone();
+        }
+        with_qemu(builder, |q| q.serial = Some(SerialMode::Stdio));
+        builder.clone()
+    });
+
+    engine.register_fn("serial_none", |builder: &mut QemuBuilder| -> QemuBuilder {
+        if builder.is_duplicate {
+            return builder.clone();
+        }
+        with_qemu(builder, |q| q.serial = Some(SerialMode::None));
+        builder.clone()
+    });
+
     engine.register_fn(
-        "serial",
-        |builder: &mut QemuBuilder, mode: &str| -> QemuBuilder {
+        "serial_file",
+        |builder: &mut QemuBuilder, path: &str| -> QemuBuilder {
             if builder.is_duplicate {
                 return builder.clone();
             }
-            set_extra(builder, "serial", mode.into());
+            let p = PathBuf::from(path);
+            with_qemu(builder, |q| q.serial = Some(SerialMode::File(p)));
             builder.clone()
         },
     );
-    engine.register_fn(
-        "test_success",
-        |builder: &mut QemuBuilder, value: &str| -> QemuBuilder {
-            if builder.is_duplicate {
-                return builder.clone();
-            }
-            set_extra(builder, "test_success", value.into());
-            builder.clone()
-        },
-    );
+
     engine.register_fn(
         "extra_args",
         |builder: &mut QemuBuilder, list: rhai::Array| -> QemuBuilder {
@@ -376,7 +396,7 @@ fn register_qemu(engine: &mut Engine, state: EngineState) {
                 return builder.clone();
             }
             match array_to_string_vec(list) {
-                Ok(v) => set_extra(builder, "extra_args", v.join(" ")),
+                Ok(mut v) => with_qemu(builder, |q| q.extra_args.append(&mut v)),
                 Err(msg) => builder.state.push_diagnostic(
                     Diagnostic::error(format!("qemu.extra_args: {msg}"))
                         .with_span(builder.state.span_from(builder.pos)),
@@ -385,6 +405,179 @@ fn register_qemu(engine: &mut Engine, state: EngineState) {
             builder.clone()
         },
     );
+
+    engine.register_fn(
+        "boot_mode",
+        |builder: &mut QemuBuilder, mode: &str| -> QemuBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            let parsed = match mode {
+                "direct" => Some(BootMode::Direct),
+                "uefi" => Some(BootMode::Uefi),
+                other => {
+                    builder.state.push_diagnostic(
+                        Diagnostic::error(format!(
+                            "qemu.boot_mode: expected \"direct\" or \"uefi\", got \"{other}\""
+                        ))
+                        .with_span(builder.state.span_from(builder.pos)),
+                    );
+                    None
+                }
+            };
+            if let Some(m) = parsed {
+                with_qemu(builder, |q| q.boot_mode = Some(m));
+            }
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "ovmf_code",
+        |builder: &mut QemuBuilder, path: &str| -> QemuBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            let p = PathBuf::from(path);
+            with_qemu(builder, |q| q.ovmf_code = Some(p));
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "ovmf_vars",
+        |builder: &mut QemuBuilder, path: &str| -> QemuBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            let p = PathBuf::from(path);
+            with_qemu(builder, |q| q.ovmf_vars = Some(p));
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "esp_dir",
+        |builder: &mut QemuBuilder, path: &str| -> QemuBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            set_esp(builder, EspSource::Dir(PathBuf::from(path)));
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "esp_image",
+        |builder: &mut QemuBuilder, path: &str| -> QemuBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            set_esp(builder, EspSource::Image(PathBuf::from(path)));
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "test_exit_port",
+        |builder: &mut QemuBuilder, port: i64| -> QemuBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            if !(0..=u16::MAX as i64).contains(&port) {
+                builder.state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "qemu.test_exit_port: value {port} out of range (0..=65535)"
+                    ))
+                    .with_span(builder.state.span_from(builder.pos)),
+                );
+            } else {
+                with_qemu(builder, |q| q.test_exit_port = Some(port as u16));
+            }
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "test_success_code",
+        |builder: &mut QemuBuilder, code: i64| -> QemuBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            if !(0..=u8::MAX as i64).contains(&code) {
+                builder.state.push_diagnostic(
+                    Diagnostic::error(format!(
+                        "qemu.test_success_code: value {code} out of range (0..=255)"
+                    ))
+                    .with_span(builder.state.span_from(builder.pos)),
+                );
+            } else {
+                with_qemu(builder, |q| q.test_success_code = Some(code as u8));
+            }
+            builder.clone()
+        },
+    );
+}
+
+// --- qemu() helpers ---
+
+fn start_qemu(s: &EngineState, pos: Position, binary: Option<String>) -> QemuBuilder {
+    let span = s.span_from(pos);
+    let mut defined = s.qemu_defined.borrow_mut();
+    let is_duplicate = *defined;
+    if is_duplicate {
+        s.push_diagnostic(
+            Diagnostic::error("qemu is defined more than once".to_string()).with_span(span),
+        );
+    } else {
+        *defined = true;
+        let mut model = s.model.borrow_mut();
+        if binary.is_some() {
+            model.qemu.binary = binary;
+        }
+        if model.qemu.span.is_none() {
+            model.qemu.span = Some(s.span_from(pos));
+        }
+    }
+    QemuBuilder {
+        state: s.clone(),
+        pos,
+        is_duplicate,
+    }
+}
+
+fn with_qemu<F: FnOnce(&mut gluon_model::QemuDef)>(builder: &QemuBuilder, f: F) {
+    let mut model = builder.state.model.borrow_mut();
+    f(&mut model.qemu);
+}
+
+fn clamp_u32(value: i64, field: &str, builder: &QemuBuilder) -> Option<u32> {
+    if !(0..=u32::MAX as i64).contains(&value) {
+        builder.state.push_diagnostic(
+            Diagnostic::error(format!(
+                "qemu.{field}: value {value} out of range (0..=4294967295)"
+            ))
+            .with_span(builder.state.span_from(builder.pos)),
+        );
+        None
+    } else {
+        Some(value as u32)
+    }
+}
+
+fn set_esp(builder: &QemuBuilder, esp: EspSource) {
+    let mut model = builder.state.model.borrow_mut();
+    if model.qemu.esp.is_some() {
+        drop(model);
+        builder.state.push_diagnostic(
+            Diagnostic::error(
+                "qemu: esp_dir / esp_image may only be called once per profile".to_string(),
+            )
+            .with_span(builder.state.span_from(builder.pos)),
+        );
+        return;
+    }
+    model.qemu.esp = Some(esp);
 }
 
 // ---------------------------------------------------------------------------

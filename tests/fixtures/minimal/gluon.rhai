@@ -26,7 +26,16 @@ target("x86_64-unknown-none");
 profile("dev")
     .target("x86_64-unknown-none")
     .opt_level(0)
-    .debug_info(true);
+    .debug_info(true)
+    .boot_binary("kernel");
+
+// QEMU config used by `gluon run`. Direct-kernel boot by default;
+// integration tests override to UEFI via --uefi.
+qemu("qemu-system-x86_64")
+    .machine("q35")
+    .memory(256)
+    .cores(1)
+    .serial_stdio();
 
 group("host_tools")
     .target("host")

@@ -104,6 +104,7 @@ fn run() -> Result<()> {
     match cli.command {
         cli::Command::Build(_) => cmd::build::run(ctx, cli.jobs),
         cli::Command::Configure(args) => cmd::configure::run(ctx, args.output),
+        cli::Command::Run(args) => cmd::run::run(ctx, cli.jobs, args),
         cli::Command::Check(_)
         | cli::Command::Clippy(_)
         | cli::Command::Clean(_)

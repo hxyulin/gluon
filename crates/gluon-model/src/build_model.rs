@@ -48,6 +48,16 @@ pub struct ProjectDef {
     /// `.gluon-config` at resolve time when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_override_file: Option<PathBuf>,
+    /// Name of the profile to use when the user did not pass
+    /// `-p/--profile` on the command line. When `None`, the CLI falls
+    /// back to the first profile in alphabetical order — which is a
+    /// footgun for projects with `debug`/`dev`/`release` profiles
+    /// because it silently picks `debug`. Setting this makes the
+    /// intent explicit and stable across fresh clones.
+    ///
+    /// Validated at intern time: the named profile must exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
 }
 
 /// A compilation target definition.
@@ -308,12 +318,93 @@ pub struct ImageDef {
     pub extras: BTreeMap<String, String>,
 }
 
-/// Stub QEMU configuration. Will be expanded in a later sub-project.
+/// QEMU configuration for `gluon run` (and future `gluon test`).
+///
+/// All fields are optional at the model level — defaults are filled in by
+/// [`resolve_qemu`](../../gluon_core/run/resolve/fn.resolve_qemu.html) at
+/// runtime. Profile-level overrides (`ProfileDef::qemu_memory`,
+/// `qemu_cores`, `qemu_extra_args`, `test_timeout`) take precedence over
+/// the values here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QemuDef {
-    pub kind: String,
-    #[serde(default)]
-    pub extras: BTreeMap<String, String>,
+    /// QEMU binary to invoke (e.g. `"qemu-system-x86_64"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    /// Machine type (`-machine <...>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// Memory in MiB (`-m <...>M`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u32>,
+    /// Core count (`-smp <...>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<u32>,
+    /// Serial policy. `Stdio` is the default applied at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<SerialMode>,
+    /// Extra QEMU arguments appended after every gluon-managed flag.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    /// Default boot mode for this profile. `None` means direct kernel boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_mode: Option<BootMode>,
+    /// Explicit OVMF CODE firmware path. Overrides env/system fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ovmf_code: Option<PathBuf>,
+    /// Explicit OVMF VARS firmware path. Overrides env/system fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ovmf_vars: Option<PathBuf>,
+    /// EFI System Partition source. Mutually exclusive variants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub esp: Option<EspSource>,
+    /// `isa-debug-exit` I/O port (for the future test harness). Defaults
+    /// to `0xf4` at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_exit_port: Option<u16>,
+    /// Success exit code written by the kernel to `test_exit_port`.
+    /// Defaults to `0x10` at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_success_code: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<SourceSpan>,
+}
+
+/// Boot method selected for `gluon run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BootMode {
+    /// Direct kernel boot via `-kernel <path>`. QEMU parses the ELF
+    /// and jumps to its entry point. Works for any kernel QEMU's
+    /// direct loader understands (multiboot, ELF64 with a plain
+    /// entry point, etc.).
+    Direct,
+    /// UEFI boot via OVMF pflash firmware. An optional ESP source
+    /// provides the bootable `EFI/BOOT/BOOTX64.EFI` (or equivalent).
+    Uefi,
+}
+
+/// Serial output policy for QEMU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SerialMode {
+    /// Forward QEMU's first serial port to the host stdio (default).
+    Stdio,
+    /// Disable serial (`-serial none`).
+    None,
+    /// Write serial output to a file (`-serial file:<path>`).
+    File(PathBuf),
+}
+
+/// Source for the EFI System Partition in UEFI boot mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EspSource {
+    /// Local directory mounted via QEMU's VVFAT driver
+    /// (`-drive format=raw,file=fat:rw:<dir>`).
+    Dir(PathBuf),
+    /// Pre-built raw disk image
+    /// (`-drive format=raw,file=<img>`).
+    Image(PathBuf),
 }
 
 impl Named for TargetDef {

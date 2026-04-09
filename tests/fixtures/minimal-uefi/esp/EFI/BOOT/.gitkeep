@@ -1,0 +1,4 @@
+# Stub ESP directory so QEMU's VVFAT driver has something to mount.
+# No actual BOOTX64.EFI is placed here — dry-run integration tests
+# only assert on the assembled argv, which they do before QEMU is
+# spawned, so a real loader is unnecessary.

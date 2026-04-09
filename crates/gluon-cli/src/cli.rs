@@ -95,6 +95,14 @@ pub enum Command {
     /// result. `--check` verifies the existing lock without touching
     /// disk; `--force` bypasses the fingerprint-match fast path.
     Vendor(VendorArgs),
+    /// Build the project and launch the boot binary under QEMU.
+    ///
+    /// Picks between direct-kernel boot (`-kernel <elf>`) and UEFI
+    /// (OVMF pflash). The boot mode is selected by (in precedence
+    /// order): `--uefi`/`--direct` CLI flags → the profile's
+    /// `qemu().boot_mode(...)` → direct. Extra arguments after `--`
+    /// are passed through to QEMU verbatim.
+    Run(RunArgs),
     /// Dispatch to an external `gluon-<name>` binary on `$PATH`.
     ///
     /// Clap's `external_subcommand` captures everything after the
@@ -141,6 +149,49 @@ pub struct ConfigureArgs {
     /// Output path for `rust-project.json` (default: `<project_root>/rust-project.json`).
     #[arg(short, long)]
     pub output: Option<PathBuf>,
+}
+
+/// Arguments for `gluon run`.
+#[derive(clap::Args, Debug)]
+pub struct RunArgs {
+    /// Force UEFI boot (OVMF pflash). Overrides the profile's
+    /// `qemu().boot_mode(...)` setting. Mutually exclusive with
+    /// `--direct`.
+    #[arg(long, conflicts_with = "direct")]
+    pub uefi: bool,
+    /// Force direct-kernel boot (`-kernel <path>`). Overrides the
+    /// profile's `qemu().boot_mode(...)` setting.
+    #[arg(long)]
+    pub direct: bool,
+    /// Wall-clock timeout in seconds. QEMU is killed on expiry and
+    /// gluon exits with a non-zero status. Overrides the profile's
+    /// `test_timeout`.
+    #[arg(short = 'T', long)]
+    pub timeout: Option<u64>,
+    /// Do not spawn QEMU; print the assembled argv and exit 0.
+    /// Useful for sanity-checking a config and for CI integration
+    /// tests.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Skip the implicit build step. Spawns QEMU directly against
+    /// whatever boot binary is currently on disk.
+    ///
+    /// Intended for tight edit/run loops where the user has just
+    /// built by hand and wants to skip gluon's fingerprint sweep. If
+    /// the binary is stale or missing, QEMU itself will report a
+    /// clearer error than gluon could from the outside.
+    #[arg(long)]
+    pub no_build: bool,
+    /// Start QEMU with a GDB server on TCP :1234 and halt the guest
+    /// CPU before executing the first instruction (`-s -S` under
+    /// the hood). Attach with `target remote :1234` from gdb. The
+    /// hint line is printed to stderr before the spawn so CI logs
+    /// pick it up too.
+    #[arg(long)]
+    pub gdb: bool,
+    /// Arguments after `--` are passed verbatim to QEMU as a suffix.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub extra: Vec<OsString>,
 }
 
 /// Arguments for `gluon vendor`.
@@ -337,6 +388,27 @@ mod tests {
             .expect_err("-j abc must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("not a number"), "got: {msg}");
+    }
+
+    #[test]
+    fn parses_run_no_build() {
+        let cli = Cli::try_parse_from(["gluon", "run", "--no-build"]).expect("parse");
+        match cli.command {
+            Command::Run(a) => {
+                assert!(a.no_build, "--no-build should set no_build = true");
+                assert!(!a.dry_run, "--dry-run should be unaffected");
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_run_no_build_default_false() {
+        let cli = Cli::try_parse_from(["gluon", "run"]).expect("parse");
+        match cli.command {
+            Command::Run(a) => assert!(!a.no_build, "no_build defaults to false"),
+            other => panic!("expected Run, got {other:?}"),
+        }
     }
 
     #[test]

@@ -453,6 +453,16 @@ fn error_message(e: &Error) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         Error::Io { path, source } => format!("I/O error at {}: {}", path.display(), source),
+        // Run-path errors never reach the scheduler today; fall back to the
+        // Display impl so they still render sensibly if they ever do.
+        other @ (Error::NoBootBinary { .. }
+        | Error::QemuBinaryNotFound { .. }
+        | Error::OvmfNotFound { .. }
+        | Error::EspMissing { .. }
+        | Error::QemuTimeout
+        | Error::QemuSpawnFailed { .. }
+        | Error::UnknownQemuTarget { .. }
+        | Error::KilledBySignal { .. }) => other.to_string(),
     }
 }
 

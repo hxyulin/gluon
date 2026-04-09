@@ -260,6 +260,10 @@ mod tests {
             debug_info: true,
             lto: None,
             boot_binary: None,
+            qemu_memory: None,
+            qemu_cores: None,
+            qemu_extra_args: Vec::new(),
+            test_timeout: None,
         }
     }
 

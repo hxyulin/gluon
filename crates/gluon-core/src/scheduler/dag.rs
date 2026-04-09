@@ -383,6 +383,10 @@ mod tests {
                 debug_info: false,
                 lto: None,
                 boot_binary: None,
+                qemu_memory: None,
+                qemu_cores: None,
+                qemu_extra_args: Vec::new(),
+                test_timeout: None,
             }
         }
 
@@ -397,6 +401,7 @@ mod tests {
                     config_crate_name: None,
                     cfg_prefix: None,
                     config_override_file: None,
+                    default_profile: None,
                 },
                 profile: make_profile(target_handle),
                 options: Default::default(),

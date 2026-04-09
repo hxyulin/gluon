@@ -15,6 +15,21 @@ use rhai::{Dynamic, Engine, Map, NativeCallContext, Position};
 // Builder types
 // ---------------------------------------------------------------------------
 
+/// Chainable builder returned by `project("name", "version")`.
+///
+/// Unlike the other builders there's no arena lookup to do — a
+/// [`BuildModel`] has exactly one project, stored in the `project`
+/// field. The builder just holds onto the engine state so its methods
+/// can mutate that field. Span handling for chained-method
+/// diagnostics is deferred: the validator catches referential errors
+/// (like `default_profile` pointing at a missing profile) after the
+/// whole script has been interned, and emits spanless diagnostics
+/// that are still actionable because they name the offending value.
+#[derive(Clone)]
+pub struct ProjectBuilder {
+    state: EngineState,
+}
+
 /// Chainable builder returned by `profile("name")`.
 #[derive(Clone)]
 pub struct ProfileBuilder {
@@ -101,16 +116,43 @@ pub(super) fn register(engine: &mut Engine, state: &EngineState) {
 // ---------------------------------------------------------------------------
 
 fn register_project(engine: &mut Engine, state: EngineState) {
+    // Registration has to clone `state` once per closure below because
+    // Rhai stores each registered fn as an owned FnPtr — the closures
+    // can't share a reference to the outer `state`.
+    let s = state.clone();
     engine.register_fn(
         "project",
-        move |ctx: NativeCallContext, name: &str, version: &str| {
-            let _pos = ctx.call_position(); // reserved for future diagnostics
-            let mut model = state.model.borrow_mut();
+        move |_ctx: NativeCallContext, name: &str, version: &str| -> ProjectBuilder {
+            let mut model = s.model.borrow_mut();
             model.project = Some(ProjectDef {
                 name: name.into(),
                 version: version.into(),
                 ..Default::default()
             });
+            ProjectBuilder { state: s.clone() }
+        },
+    );
+
+    // `.default_profile("name")` — sets the profile the CLI picks
+    // when the user doesn't pass `-p/--profile`. We validate the
+    // referenced profile exists at intern time (here), not at resolve
+    // time, so the script fails loudly at parse if the user mistypes
+    // the name. Validation is deferred to post-eval, since profiles
+    // are typically declared after `project(...)` in the same script
+    // — we stash the value and the intern check happens once the
+    // model is fully populated (see `engine::validate`).
+    //
+    // For now we just store the raw string and let the validator
+    // catch bad references. If the referenced profile doesn't exist,
+    // the validator emits a diagnostic with the span captured here.
+    engine.register_fn(
+        "default_profile",
+        move |builder: &mut ProjectBuilder, name: &str| -> ProjectBuilder {
+            let mut model = builder.state.model.borrow_mut();
+            if let Some(project) = model.project.as_mut() {
+                project.default_profile = Some(name.into());
+            }
+            builder.clone()
         },
     );
 }

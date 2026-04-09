@@ -16,10 +16,37 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) fn validate(model: &BuildModel) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     check_project_present(model, &mut diags);
+    check_default_profile_exists(model, &mut diags);
     check_profile_inheritance_cycles(model, &mut diags);
     check_crate_output_name_uniqueness(model, &mut diags);
     check_pipeline_stage_references(model, &mut diags);
     diags
+}
+
+/// Reject `project().default_profile("name")` when "name" doesn't
+/// match any declared profile. Runs after interning so
+/// `model.profiles.lookup` is authoritative. Without this check a
+/// typo in `default_profile` would only be caught at run time when
+/// the CLI tried to look up the profile and silently fell back to
+/// alphabetical order — the exact footgun the field exists to fix.
+fn check_default_profile_exists(model: &BuildModel, diags: &mut Vec<Diagnostic>) {
+    let Some(project) = model.project.as_ref() else {
+        return;
+    };
+    let Some(name) = project.default_profile.as_deref() else {
+        return;
+    };
+    if model.profiles.lookup(name).is_none() {
+        let known: Vec<&str> = model.profiles.names().map(|(n, _)| n).collect();
+        let known_list = if known.is_empty() {
+            "no profiles declared".to_string()
+        } else {
+            known.join(", ")
+        };
+        diags.push(Diagnostic::error(format!(
+            "project().default_profile(\"{name}\") references an unknown profile. Known profiles: {known_list}"
+        )));
+    }
 }
 
 fn check_project_present(model: &BuildModel, diags: &mut Vec<Diagnostic>) {
@@ -191,5 +218,84 @@ mod tests {
         let mut diags = Vec::new();
         check_crate_output_name_uniqueness(&model, &mut diags);
         assert!(diags.is_empty(), "no collision expected, got: {diags:?}");
+    }
+
+    fn make_project_with_default_profile(default: Option<&str>) -> gluon_model::ProjectDef {
+        gluon_model::ProjectDef {
+            name: "demo".into(),
+            version: "0.1.0".into(),
+            default_profile: default.map(|s| s.into()),
+            ..Default::default()
+        }
+    }
+
+    fn make_profile(name: &str) -> ProfileDef {
+        ProfileDef {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    fn model_with_project(default: Option<&str>) -> BuildModel {
+        BuildModel {
+            project: Some(make_project_with_default_profile(default)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_profile_none_passes() {
+        let mut model = model_with_project(None);
+        let _ = model.profiles.insert("dev".into(), make_profile("dev"));
+
+        let mut diags = Vec::new();
+        check_default_profile_exists(&model, &mut diags);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn default_profile_existing_name_passes() {
+        let mut model = model_with_project(Some("release"));
+        let _ = model.profiles.insert("dev".into(), make_profile("dev"));
+        let _ = model
+            .profiles
+            .insert("release".into(), make_profile("release"));
+
+        let mut diags = Vec::new();
+        check_default_profile_exists(&model, &mut diags);
+        assert!(diags.is_empty(), "no diag expected, got: {diags:?}");
+    }
+
+    #[test]
+    fn default_profile_unknown_name_errors() {
+        let mut model = model_with_project(Some("typo"));
+        let _ = model.profiles.insert("dev".into(), make_profile("dev"));
+        let _ = model
+            .profiles
+            .insert("release".into(), make_profile("release"));
+
+        let mut diags = Vec::new();
+        check_default_profile_exists(&model, &mut diags);
+        assert_eq!(diags.len(), 1);
+        let msg = &diags[0].message;
+        assert!(msg.contains("typo"), "diag must name the bad value: {msg}");
+        // Known list must be included so the user sees what's valid.
+        assert!(
+            msg.contains("dev") && msg.contains("release"),
+            "diag must list known profiles: {msg}"
+        );
+    }
+
+    #[test]
+    fn default_profile_with_no_profiles_at_all_errors_clearly() {
+        // No profiles registered at all — still an error, but the
+        // diagnostic should say so rather than claim the name is in
+        // an empty list.
+        let model = model_with_project(Some("dev"));
+
+        let mut diags = Vec::new();
+        check_default_profile_exists(&model, &mut diags);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("no profiles declared"));
     }
 }

@@ -103,6 +103,38 @@ pub enum Error {
 
     #[error("compile error: {0}")]
     Compile(String),
+
+    #[error("profile '{profile}' has no boot_binary set — required by `gluon run`")]
+    NoBootBinary { profile: String },
+
+    #[error(
+        "QEMU binary '{binary}' not found on PATH — install QEMU or set a different binary via `qemu(\"<path>\")`"
+    )]
+    QemuBinaryNotFound { binary: String },
+
+    #[error("no OVMF firmware found.\n{attempts}")]
+    OvmfNotFound { attempts: String },
+
+    #[error("ESP source path does not exist: {path}")]
+    EspMissing { path: PathBuf },
+
+    #[error("QEMU run exceeded timeout and was killed")]
+    QemuTimeout,
+
+    #[error("failed to spawn QEMU binary '{binary}': {source}")]
+    QemuSpawnFailed {
+        binary: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "cannot pick a default QEMU binary for target '{triple}': unknown architecture.\nSet one explicitly with `qemu(\"qemu-system-<arch>\")` in your gluon.rhai."
+    )]
+    UnknownQemuTarget { triple: String },
+
+    #[error("QEMU run killed by signal {signal} (cleanly torn down by gluon)")]
+    KilledBySignal { signal: i32 },
 }
 
 fn render_diagnostics(diags: &[Diagnostic]) -> String {

@@ -34,6 +34,7 @@ pub mod clippy;
 pub mod configure;
 pub mod external;
 pub mod fmt;
+pub mod run;
 pub mod vendor;
 
 use anyhow::{Context, Result};
@@ -324,10 +325,28 @@ pub fn build_layout_context(
     build_layout_context_at(&cwd, profile, target, config_file)
 }
 
-/// Return the first profile name defined in the model, or `None` if the
-/// model declares no profiles at all. `Arena::names` iterates in
-/// BTreeMap (alphabetical) order, so this is deterministic.
+/// Pick the default profile when the user did not pass `-p/--profile`.
+///
+/// Precedence:
+///
+/// 1. `project().default_profile("...")` if set — this is the user's
+///    explicit choice and we prefer it over any derived default.
+///    Validation at intern time guarantees the named profile exists,
+///    so we can dereference it here without re-checking.
+/// 2. Otherwise the first profile name in alphabetical order
+///    (`Arena::names` iterates over a `BTreeMap`, so this is
+///    deterministic). Historically this was the only behaviour; it
+///    remains a sensible fallback for single-profile projects, but
+///    is a footgun for `debug`/`dev`/`release` — which is exactly
+///    what the explicit `default_profile` field is there to prevent.
+///
+/// Returns `None` only if the model declares no profiles at all.
 fn default_profile(model: &BuildModel) -> Option<&str> {
+    if let Some(project) = model.project.as_ref() {
+        if let Some(name) = project.default_profile.as_deref() {
+            return Some(name);
+        }
+    }
     model.profiles.names().next().map(|(name, _)| name)
 }
 

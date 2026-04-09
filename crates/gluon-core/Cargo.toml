@@ -18,6 +18,15 @@ thiserror = "1"
 toml = "0.8"
 walkdir = "2"
 
+# Signal handling for `gluon run`: catches SIGINT/SIGTERM so the
+# spawned QEMU child can be killed cleanly instead of wedging. Used
+# only by the runner (`run::entry`); the rest of gluon-core does not
+# touch signals. Scoped to Unix because the runner's signal trapping
+# is a no-op on Windows (console Ctrl+C handling is a different
+# mechanism and the runner is Unix-centric today).
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
 [features]
 # Enables tests that touch the network (e.g. `cargo vendor` pulling from
 # crates.io). Off by default so `cargo test` works offline; CI turns this

@@ -339,6 +339,7 @@ mod tests {
                 config_crate_name: None,
                 cfg_prefix: None,
                 config_override_file: None,
+                default_profile: None,
             },
             profile: ResolvedProfile {
                 name: "dev".into(),
@@ -347,6 +348,10 @@ mod tests {
                 debug_info: false,
                 lto: None,
                 boot_binary: None,
+                qemu_memory: None,
+                qemu_cores: None,
+                qemu_extra_args: Vec::new(),
+                test_timeout: None,
             },
             options: BTreeMap::new(),
             crates: Vec::new(),
@@ -587,6 +592,7 @@ mod tests {
                 config_crate_name: None,
                 cfg_prefix: None,
                 config_override_file: None,
+                default_profile: None,
             },
             profile: ResolvedProfile {
                 name: "dev".into(),
@@ -595,6 +601,10 @@ mod tests {
                 debug_info: false,
                 lto: None,
                 boot_binary: None,
+                qemu_memory: None,
+                qemu_cores: None,
+                qemu_extra_args: Vec::new(),
+                test_timeout: None,
             },
             options: BTreeMap::new(),
             crates: vec![gluon_model::ResolvedCrateRef {
