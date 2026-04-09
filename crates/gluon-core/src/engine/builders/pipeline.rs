@@ -298,6 +298,22 @@ fn register_pipeline(engine: &mut Engine, state: EngineState) {
 
     builder_method!(
         engine,
+        "rule",
+        PipelineBuilder,
+        |state, model, name, pos, rule_name: &str| {
+            let _ = (state, pos);
+            if let Some(h) = model.pipelines.lookup(name) {
+                if let Some(p) = model.pipelines.get_mut(h) {
+                    if let Some(last) = p.stages.last_mut() {
+                        last.rule = Some(rule_name.into());
+                    }
+                }
+            }
+        }
+    );
+
+    builder_method!(
+        engine,
         "barrier",
         PipelineBuilder,
         |state, model, name, pos, barrier_name: &str| {

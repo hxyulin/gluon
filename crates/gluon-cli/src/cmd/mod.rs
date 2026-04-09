@@ -139,7 +139,10 @@ pub fn build_context_at_for_driver(
     let rustc_info = Arc::new(
         RustcInfo::load_or_probe(&layout).context("failed to load or probe rustc metadata")?,
     );
-    let cache = Cache::load(layout.cache_manifest()).context("failed to load cache manifest")?;
+    let (cache, cache_warnings) = Cache::load(layout.cache_manifest());
+    for w in &cache_warnings {
+        eprintln!("{w}");
+    }
     let ctx = CompileCtx::new(layout, rustc_info, cache);
 
     Ok(CmdContext {

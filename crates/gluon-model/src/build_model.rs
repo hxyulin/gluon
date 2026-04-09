@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+fn default_true() -> bool {
+    true
+}
+
 /// The complete build model produced by evaluating `gluon.rhai`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct BuildModel {
@@ -231,7 +235,7 @@ pub struct CrateDef {
 /// This is the strict single-form representation. The map key on
 /// `CrateDef::deps` is the extern name; this struct holds the referenced
 /// crate name and resolution metadata.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepDef {
     pub crate_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,8 +243,30 @@ pub struct DepDef {
     pub features: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// When `true`, this dependency is optional and only linked when a
+    /// feature gate enables it.
+    #[serde(default)]
+    pub optional: bool,
+    /// When `false`, the dependency's default features are suppressed.
+    /// Defaults to `true` (Cargo convention).
+    #[serde(default = "default_true")]
+    pub default_features: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceSpan>,
+}
+
+impl Default for DepDef {
+    fn default() -> Self {
+        Self {
+            crate_name: String::new(),
+            crate_handle: None,
+            features: Vec::new(),
+            version: None,
+            optional: false,
+            default_features: true,
+            span: None,
+        }
+    }
 }
 
 /// Source location for an external dependency.

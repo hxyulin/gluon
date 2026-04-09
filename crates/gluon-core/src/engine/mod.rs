@@ -289,27 +289,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_default_features_key() {
+    fn accepts_default_features_and_optional_keys() {
         let f = write_script(
             r#"
             project("test", "0.1.0");
             target("x86_64-unknown-test", "targets/x.json");
             let g = group("k").target("x86_64-unknown-test");
+            g.add("bar", "crates/bar");
             g.add("foo", "crates/foo")
-                .deps(#{ bar: #{ crate: "bar", default_features: false } });
+                .deps(#{ bar: #{ crate: "bar", default_features: false, optional: true } });
             "#,
         );
-        let err = evaluate_script(f.path()).expect_err("should fail");
-        match err {
-            Error::Diagnostics(v) => {
-                assert!(
-                    v.iter()
-                        .any(|d| d.message.contains("unknown dep option 'default_features'")),
-                    "expected 'unknown dep option default_features' diagnostic, got: {v:?}"
-                );
-            }
-            other => panic!("expected Error::Diagnostics, got {other:?}"),
-        }
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let krate_h = model.crates.lookup("foo").expect("foo exists");
+        let krate = model.crates.get(krate_h).unwrap();
+        let dep = krate.deps.get("bar").expect("bar dep exists");
+        assert!(!dep.default_features);
+        assert!(dep.optional);
     }
 
     #[test]
@@ -1167,7 +1163,48 @@ mod tests {
         }
     }
 
-    // TODO: test pipeline rule resolution when PipelineStep.rule has a
-    // script-facing setter (currently the rhai pipeline builder does not
-    // expose one, so there's no way to construct an invalid reference).
+    #[test]
+    fn pipeline_stage_with_invalid_rule_is_diagnosed() {
+        let f = write_script(
+            r#"
+            project("test", "0.1.0");
+            target("x86_64-unknown-test", "targets/x.json");
+            group("kernel").target("x86_64-unknown-test");
+            pipeline()
+                .stage("compile", ["kernel"])
+                .rule("nonexistent_rule");
+            "#,
+        );
+        let err = evaluate_script(f.path()).expect_err("should diagnose invalid rule");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter()
+                        .any(|d| d.message.contains("references unknown rule")),
+                    "expected 'references unknown rule' diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_stage_with_valid_rule_succeeds() {
+        let f = write_script(
+            r#"
+            project("test", "0.1.0");
+            target("x86_64-unknown-test", "targets/x.json");
+            group("kernel").target("x86_64-unknown-test");
+            rule("my_rule").handler("exec");
+            pipeline()
+                .stage("compile", ["kernel"])
+                .rule("my_rule");
+            "#,
+        );
+        let model = evaluate_script(f.path()).expect("script must evaluate");
+        let ph = model.pipelines.lookup("main").expect("pipeline exists");
+        let pipeline = model.pipelines.get(ph).unwrap();
+        assert_eq!(pipeline.stages.len(), 1);
+        assert_eq!(pipeline.stages[0].rule.as_deref(), Some("my_rule"));
+    }
 }

@@ -788,7 +788,7 @@ mod tests {
         // tolerates a missing manifest file, so the order there doesn't
         // matter — but save() does not tolerate a missing parent dir.
         std::fs::create_dir_all(tmp.join("build")).unwrap();
-        let cache = Cache::load(tmp.join("build/cache-manifest.json")).expect("load cache");
+        let cache = Cache::load(tmp.join("build/cache-manifest.json")).0;
         CompileCtx::new(layout, Arc::new(info), cache)
     }
 
@@ -1602,7 +1602,7 @@ mod tests {
         // also empty, so the set-comparison in is_fresh passes trivially.
         let cache_key = "crate:host:cached_crate".to_string();
         {
-            let mut cache = Cache::load(&manifest_path).expect("load");
+            let mut cache = Cache::load(&manifest_path).0;
             cache
                 .mark_built(BuildRecord {
                     key: cache_key,
@@ -1946,7 +1946,7 @@ mod tests {
 
         let rustc_info = RustcInfo::probe().expect("probe rustc");
         let layout = BuildLayout::new(tmp.path().join("build"), "e2e");
-        let cache = Cache::load(layout.cache_manifest()).expect("load cache");
+        let cache = Cache::load(layout.cache_manifest()).0;
         std::fs::create_dir_all(layout.root()).unwrap();
         let ctx = CompileCtx::new(layout, Arc::new(rustc_info), cache);
 

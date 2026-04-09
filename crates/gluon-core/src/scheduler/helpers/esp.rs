@@ -109,11 +109,11 @@ fn fingerprint_source(path: &Path) -> Result<(i128, u64)> {
     let mtime_ns = md
         .modified()
         .ok()
-        .and_then(|t| {
+        .map(|t| {
             use std::time::UNIX_EPOCH;
             match t.duration_since(UNIX_EPOCH) {
-                Ok(d) => Some(d.as_nanos() as i128),
-                Err(e) => Some(-(e.duration().as_nanos() as i128)),
+                Ok(d) => d.as_nanos() as i128,
+                Err(e) => -(e.duration().as_nanos() as i128),
             }
         })
         .unwrap_or(0);
@@ -283,7 +283,7 @@ mod tests {
     fn make_ctx(tmp: &Path) -> CompileCtx {
         let layout = BuildLayout::new(tmp.join("build"), "t");
         std::fs::create_dir_all(tmp.join("build")).unwrap();
-        let cache = Cache::load(tmp.join("build/cache-manifest.json")).expect("cache load");
+        let cache = Cache::load(tmp.join("build/cache-manifest.json")).0;
         CompileCtx::new(layout, Arc::new(fake_rustc_info()), cache)
     }
 

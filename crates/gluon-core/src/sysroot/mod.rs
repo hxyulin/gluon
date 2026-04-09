@@ -375,7 +375,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let layout = BuildLayout::new(tmp.path(), "sysroot-unit");
         let info = fake_rustc_info(PathBuf::from("/usr/bin/rustc"), None);
-        let cache = Cache::load(layout.cache_manifest()).expect("load cache");
+        let cache = Cache::load(layout.cache_manifest()).0;
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
 
         let target = make_target();
@@ -423,7 +423,7 @@ mod tests {
         let stamp_path = layout.sysroot_stamp(&target);
         std::fs::write(&stamp_path, version_hex.as_bytes()).expect("write stamp");
 
-        let cache = Cache::load(layout.cache_manifest()).expect("load cache");
+        let cache = Cache::load(layout.cache_manifest()).0;
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
         let (got, was_cached) = ensure_sysroot(&ctx, &target).expect("fast path");
         assert_eq!(got, sysroot_dir);
@@ -452,7 +452,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let layout = BuildLayout::new(tmp.path(), "sysroot-e2e");
         let target = make_target();
-        let cache = Cache::load(layout.cache_manifest()).expect("load cache");
+        let cache = Cache::load(layout.cache_manifest()).0;
         let expected_hex = hex_encode(&info.version_hash());
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
 
@@ -505,7 +505,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let layout = BuildLayout::new(tmp.path(), "sysroot-downstream");
         let target = make_target();
-        let cache = Cache::load(layout.cache_manifest()).expect("load cache");
+        let cache = Cache::load(layout.cache_manifest()).0;
         let rustc_path = info.rustc_path.clone();
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
 

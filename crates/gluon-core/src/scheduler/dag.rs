@@ -202,18 +202,20 @@ impl Default for Dag {
 ///    Both host→host and cross→cross (and host→cross for proc-macros) are
 ///    modelled here; cross→host is architecturally nonsensical but not
 ///    explicitly rejected.
-/// 4a. **Crate → Crate (artifact_deps)**: Every crate depends on every entry
-///     in its `CrateDef::artifact_deps` list that resolves to a crate present
-///     in `resolved.crates`. Unlike regular `deps`, artifact deps do not
-///     produce `--extern` flags — they exist purely to enforce build ordering
-///     across crates that reference each other's build outputs (e.g. a
-///     bootloader that `include_bytes!`es a kernel ELF via an `artifact_env`
-///     injected `KERNEL_PATH`). Edges are group- and target-agnostic; a
-///     `x86_64-unknown-uefi` bootloader can artifact-depend on a
-///     `x86_64-unknown-none` kernel and the cross-group edge is added here.
-///     Dangling names (no matching crate in the model) are a resolver-level
-///     error surfaced by `validate::check_artifact_deps_resolve`; this
-///     function silently skips them as a belt-and-braces backstop.
+///
+/// 4a. **Crate → Crate (artifact_deps)**: Every crate depends on every
+///   entry in its `CrateDef::artifact_deps` list that resolves to a crate
+///   present in `resolved.crates`. Unlike regular `deps`, artifact deps do
+///   not produce `--extern` flags — they exist purely to enforce build
+///   ordering across crates that reference each other's build outputs (e.g.
+///   a bootloader that `include_bytes!`es a kernel ELF via an
+///   `artifact_env` injected `KERNEL_PATH`). Edges are group- and
+///   target-agnostic; a `x86_64-unknown-uefi` bootloader can
+///   artifact-depend on a `x86_64-unknown-none` kernel and the cross-group
+///   edge is added here. Dangling names (no matching crate in the model)
+///   are a resolver-level error surfaced by
+///   `validate::check_artifact_deps_resolve`; this function silently skips
+///   them as a belt-and-braces backstop.
 /// 5. **Pipeline stage barrier**: Each stage in each pipeline becomes one or
 ///    more rule nodes. Every node in stage N depends on every node in
 ///    stage N−1 (bipartite barrier). In MVP-M each stage has at most one rule

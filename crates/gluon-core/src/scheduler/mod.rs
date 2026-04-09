@@ -362,7 +362,7 @@ mod tests {
         let layout = BuildLayout::new(tmp.join("build"), "testproj");
         let info = fake_rustc_info("/usr/bin/rustc");
         std::fs::create_dir_all(tmp.join("build")).unwrap();
-        let cache = Cache::load(tmp.join("build/cache-manifest.json")).expect("load cache");
+        let cache = Cache::load(tmp.join("build/cache-manifest.json")).0;
         CompileCtx::new(layout, Arc::new(info), cache)
     }
 
@@ -663,7 +663,7 @@ mod tests {
 
         // --- CompileCtx ---
         let layout = BuildLayout::new(build_dir.clone(), "testproj");
-        let cache = Cache::load(layout.cache_manifest()).expect("load cache");
+        let cache = Cache::load(layout.cache_manifest()).0;
         let ctx = CompileCtx::new(layout, Arc::new(info.clone()), cache);
 
         (ctx, model, resolved)

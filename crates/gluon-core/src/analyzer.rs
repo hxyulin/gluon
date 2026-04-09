@@ -152,15 +152,24 @@ pub fn generate_rust_project_json(
 
         // --- cfg ---
         //
-        // We emit the crate's own raw `cfg_flags` verbatim. For cross
-        // crates we *could* also derive `target_arch`, `target_os`,
-        // `target_pointer_width` from `TargetDef::spec`, but that
-        // requires either parsing a custom-target spec JSON file or
-        // shelling out to `rustc --print=cfg --target=...`. Both are
-        // out of scope for the MVP-M analyzer; rust-analyzer will
-        // still index the crate, just without target-specific cfgs.
-        // TODO: derive target cfgs once a stable spec parser exists.
-        let cfg: Vec<String> = krate.cfg_flags.clone();
+        // Start with the crate's own explicit `cfg_flags`, then merge
+        // target-specific cfgs (target_arch, target_os, etc.) derived
+        // from `rustc --print=cfg --target=<triple>`. For host crates
+        // we skip the probe — they compile for the build machine and
+        // rust-analyzer already knows its cfgs. If the probe fails
+        // (custom target JSON not on the search path) we gracefully
+        // degrade to user-provided cfgs only.
+        let mut cfg: Vec<String> = krate.cfg_flags.clone();
+        if !cref.host {
+            if let Some(target_def) = model.targets.get(cref.target) {
+                let target_cfgs = rustc_info.target_cfgs(&target_def.name);
+                for tc in target_cfgs {
+                    if !cfg.contains(&tc) {
+                        cfg.push(tc);
+                    }
+                }
+            }
+        }
 
         let entry = json!({
             "root_module": root_module.to_string_lossy(),
@@ -465,9 +474,7 @@ mod tests {
             DepDef {
                 crate_name: "real-name".into(),
                 crate_handle: Some(target_ch),
-                features: Vec::new(),
-                version: None,
-                span: None,
+                ..Default::default()
             },
         );
         let (consumer_ch, _) = model.crates.insert(
@@ -531,9 +538,7 @@ mod tests {
             DepDef {
                 crate_name: "phantom".into(),
                 crate_handle: Some(phantom),
-                features: Vec::new(),
-                version: None,
-                span: None,
+                ..Default::default()
             },
         );
         let (consumer_ch, _) = model.crates.insert(

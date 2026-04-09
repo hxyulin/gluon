@@ -362,7 +362,7 @@ mod tests {
     fn make_ctx(build_root: &Path) -> CompileCtx {
         let layout = BuildLayout::new(build_root, "demo");
         fs::create_dir_all(build_root).unwrap();
-        let cache = Cache::load(layout.cache_manifest()).expect("load cache");
+        let cache = Cache::load(layout.cache_manifest()).0;
         CompileCtx::new(layout, Arc::new(fake_rustc_info()), cache)
     }
 

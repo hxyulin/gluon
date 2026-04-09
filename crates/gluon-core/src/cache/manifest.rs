@@ -34,7 +34,7 @@
 //! cache directory would slowly accumulate `.tmp.*` orphans across
 //! repeated failed builds.
 
-use crate::error::{Error, Result};
+use crate::error::{Diagnostic, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -71,9 +71,17 @@ pub struct CacheEntry {
     /// Source files consumed by the build, with per-file fingerprints.
     /// `BTreeMap` for deterministic iteration / serialisation order.
     pub source_files: BTreeMap<PathBuf, FileFingerprint>,
-    /// Reserved for the directory-watch freshness upgrade in session B —
-    /// currently written as an empty map. See
-    /// [`crate::cache::Cache::is_fresh`].
+    /// Mtimes (nanoseconds since `UNIX_EPOCH`) of the direct parent
+    /// directories of all source files. A change in directory mtime
+    /// indicates that files were added or removed — catching new-file
+    /// additions that per-file tracking alone would miss.
+    ///
+    /// Backwards-compatible: older manifests deserialise with an empty
+    /// map via `#[serde(default)]`; newer manifests read by older gluon
+    /// versions silently ignore the populated field (the old code had
+    /// `let _ = &entry.parent_dir_mtimes`). Both directions degrade to
+    /// a more conservative freshness check, never to incorrect caching.
+    #[serde(default)]
     pub parent_dir_mtimes: BTreeMap<PathBuf, u128>,
     /// Path to the artefact this entry declares as built. `is_fresh`
     /// requires this file to exist for the entry to be considered fresh.
@@ -98,54 +106,52 @@ impl CacheManifest {
 
     /// Load a manifest from disk.
     ///
-    /// Returns `Ok(default)` on any of: file missing, file unreadable,
-    /// JSON parse failure, version mismatch. Readable but unparseable
-    /// files produce a single `warning: cache manifest corrupted` line on
-    /// stderr before the cold-cache fallback kicks in — see the
-    /// module-level "corruption policy" doc.
-    pub fn load(path: &Path) -> Result<Self> {
+    /// Returns `(manifest, warnings)` — the manifest is always usable
+    /// (cold-cache fallback on any corruption), and warnings are
+    /// [`Diagnostic`]s the caller can surface or suppress. On any of:
+    /// file missing, file unreadable, JSON parse failure, or version
+    /// mismatch, the returned manifest is a fresh default.
+    pub fn load(path: &Path) -> (Self, Vec<Diagnostic>) {
+        let mut warnings = Vec::new();
+
         let bytes = match fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::fresh());
+                return (Self::fresh(), warnings);
             }
             Err(_) => {
-                // Unreadable-but-present manifest: treat as cold cache,
-                // same as the parse-failure path below.
-                // TODO(session-B): route through a Diagnostics sink and
-                // honour a quiet flag.
-                eprintln!(
-                    "warning: gluon cache manifest at {} is unreadable; treating as cold cache.",
-                    path.display()
+                warnings.push(
+                    Diagnostic::warning(format!(
+                        "cache manifest at {} is unreadable; treating as cold cache",
+                        path.display()
+                    ))
+                    .with_note("Next build will rebuild from scratch. Delete the file to silence this warning."),
                 );
-                eprintln!(
-                    "         Next build will rebuild from scratch. Delete the file to silence this warning."
-                );
-                return Ok(Self::fresh());
+                return (Self::fresh(), warnings);
             }
         };
         match serde_json::from_slice::<CacheManifest>(&bytes) {
-            Ok(m) if m.version == Self::CURRENT_VERSION => Ok(m),
+            Ok(m) if m.version == Self::CURRENT_VERSION => (m, warnings),
             Ok(m) => {
-                eprintln!(
-                    "warning: gluon cache manifest at {} is version {}; treating as cold cache.",
-                    path.display(),
-                    m.version
+                warnings.push(
+                    Diagnostic::warning(format!(
+                        "cache manifest at {} is version {}; treating as cold cache",
+                        path.display(),
+                        m.version
+                    ))
+                    .with_note("Next build will rebuild from scratch. Delete the file to silence this warning."),
                 );
-                eprintln!(
-                    "         Next build will rebuild from scratch. Delete the file to silence this warning."
-                );
-                Ok(Self::fresh())
+                (Self::fresh(), warnings)
             }
             Err(_) => {
-                eprintln!(
-                    "warning: gluon cache manifest at {} is corrupted; treating as cold cache.",
-                    path.display()
+                warnings.push(
+                    Diagnostic::warning(format!(
+                        "cache manifest at {} is corrupted; treating as cold cache",
+                        path.display()
+                    ))
+                    .with_note("Next build will rebuild from scratch. Delete the file to silence this warning."),
                 );
-                eprintln!(
-                    "         Next build will rebuild from scratch. Delete the file to silence this warning."
-                );
-                Ok(Self::fresh())
+                (Self::fresh(), warnings)
             }
         }
     }
@@ -288,7 +294,7 @@ mod tests {
         m.entries.insert("foo".into(), sample_entry());
         m.save_atomic(&p).expect("save");
 
-        let loaded = CacheManifest::load(&p).expect("load");
+        let loaded = CacheManifest::load(&p).0;
         assert_eq!(loaded.version, CacheManifest::CURRENT_VERSION);
         assert_eq!(loaded.entries.get("foo"), Some(&sample_entry()));
     }
@@ -297,28 +303,32 @@ mod tests {
     fn missing_file_returns_default() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let p = tmp.path().join("nope.json");
-        let loaded = CacheManifest::load(&p).expect("load default");
+        let loaded = CacheManifest::load(&p).0;
         assert_eq!(loaded.version, CacheManifest::CURRENT_VERSION);
         assert!(loaded.entries.is_empty());
     }
 
     #[test]
-    fn corrupted_json_returns_default() {
+    fn corrupted_json_returns_default_with_warning() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let p = tmp.path().join("bad.json");
         std::fs::write(&p, b"not json at all").expect("seed");
-        let loaded = CacheManifest::load(&p).expect("load default");
+        let (loaded, warnings) = CacheManifest::load(&p);
         assert!(loaded.entries.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("corrupted"));
     }
 
     #[test]
-    fn wrong_version_returns_default() {
+    fn wrong_version_returns_default_with_warning() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let p = tmp.path().join("v99.json");
         std::fs::write(&p, br#"{"version": 99, "entries": {}}"#).expect("seed");
-        let loaded = CacheManifest::load(&p).expect("load default");
+        let (loaded, warnings) = CacheManifest::load(&p);
         assert!(loaded.entries.is_empty());
         assert_eq!(loaded.version, CacheManifest::CURRENT_VERSION);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("version"));
     }
 
     #[test]
@@ -431,7 +441,7 @@ mod tests {
         }
         m.save_atomic(&p).expect("save");
 
-        let loaded = CacheManifest::load(&p).expect("load");
+        let loaded = CacheManifest::load(&p).0;
         let keys: Vec<_> = loaded.entries.keys().cloned().collect();
         assert_eq!(keys, vec!["a".to_string(), "m".into(), "z".into()]);
     }

@@ -89,18 +89,30 @@ pub struct BuildRecord {
     pub output_path: PathBuf,
 }
 
+/// Read a directory's mtime as nanoseconds since `UNIX_EPOCH`.
+/// Returns `None` on any I/O or time-conversion failure.
+fn dir_mtime_ns(path: &Path) -> Option<u128> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    Some(mtime.duration_since(UNIX_EPOCH).ok()?.as_nanos())
+}
+
 impl Cache {
     /// Load a cache from disk. A missing or corrupted manifest silently
     /// degrades to an empty cache — see [`CacheManifest::load`] for the
-    /// policy and rationale.
-    pub fn load(manifest_path: impl Into<PathBuf>) -> Result<Self> {
+    /// policy and rationale. Returns any non-fatal warnings the manifest
+    /// loader produced (e.g. version mismatch, corruption).
+    pub fn load(manifest_path: impl Into<PathBuf>) -> (Self, Vec<crate::error::Diagnostic>) {
         let manifest_path = manifest_path.into();
-        let manifest = CacheManifest::load(&manifest_path)?;
-        Ok(Self {
-            manifest_path,
-            manifest,
-            dirty: false,
-        })
+        let (manifest, warnings) = CacheManifest::load(&manifest_path);
+        (
+            Self {
+                manifest_path,
+                manifest,
+                dirty: false,
+            },
+            warnings,
+        )
     }
 
     /// Persist the manifest via [`CacheManifest::save_atomic`]. No-op
@@ -199,9 +211,18 @@ impl Cache {
             refreshes.push((src.to_path_buf(), cur_mtime, cur_size));
         }
 
-        // TODO(session-B): when parent-dir-mtime tracking lands, verify
-        // each recorded directory mtime here before declaring fresh.
-        let _ = &entry.parent_dir_mtimes;
+        // Verify parent-directory mtimes. A directory's mtime changes
+        // when files are added or removed — this catches new source
+        // files that wouldn't appear in the per-file check above.
+        for (dir, &recorded_mtime) in &entry.parent_dir_mtimes {
+            let current_mtime = match dir_mtime_ns(dir) {
+                Some(m) => m,
+                None => return false,
+            };
+            if current_mtime != recorded_mtime {
+                return false;
+            }
+        }
 
         if !refreshes.is_empty()
             && let Some(entry_mut) = self.manifest.entries.get_mut(q.key)
@@ -263,6 +284,20 @@ impl Cache {
             );
         }
 
+        // Collect mtimes for direct parent directories of all source
+        // files. Directory mtime changes when files are added or removed,
+        // so this catches new-file additions that per-file tracking misses.
+        let mut parent_dir_mtimes: BTreeMap<PathBuf, u128> = BTreeMap::new();
+        for src in &rec.sources {
+            if let Some(parent) = src.parent() {
+                if !parent_dir_mtimes.contains_key(parent) {
+                    if let Some(mtime) = dir_mtime_ns(parent) {
+                        parent_dir_mtimes.insert(parent.to_path_buf(), mtime);
+                    }
+                }
+            }
+        }
+
         let built_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -271,9 +306,7 @@ impl Cache {
         let entry = CacheEntry {
             argv_hash: rec.argv_hash,
             source_files,
-            // Populated empty; reserved for the session-B directory-watch
-            // upgrade. See the `TODO(session-B)` in `is_fresh`.
-            parent_dir_mtimes: BTreeMap::new(),
+            parent_dir_mtimes,
             output_path: rec.output_path,
             built_at,
         };
@@ -297,30 +330,41 @@ mod tests {
 
     struct Fixture {
         _tmp: tempfile::TempDir,
-        root: PathBuf,
+        /// Directory for source files. Separate from `build_dir` so
+        /// manifest writes don't change the source directory's mtime.
+        src_dir: PathBuf,
+        /// Directory for build outputs and the cache manifest.
+        build_dir: PathBuf,
         manifest_path: PathBuf,
     }
 
     impl Fixture {
         fn new() -> Self {
             let tmp = tempfile::tempdir().expect("tempdir");
-            let root = tmp.path().to_path_buf();
-            let manifest_path = root.join("cache-manifest.json");
+            let src_dir = tmp.path().join("src");
+            let build_dir = tmp.path().join("build");
+            fs::create_dir_all(&src_dir).expect("mkdir src");
+            fs::create_dir_all(&build_dir).expect("mkdir build");
+            let manifest_path = build_dir.join("cache-manifest.json");
             Self {
                 _tmp: tmp,
-                root,
+                src_dir,
+                build_dir,
                 manifest_path,
             }
         }
 
         fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
-            let p = self.root.join(name);
+            let p = self.src_dir.join(name);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).expect("mkdir parent");
+            }
             fs::write(&p, bytes).expect("write source");
             p
         }
 
         fn touch_output(&self, name: &str) -> PathBuf {
-            let p = self.root.join(name);
+            let p = self.build_dir.join(name);
             File::create(&p).expect("create output");
             p
         }
@@ -361,7 +405,7 @@ mod tests {
         let out = fx.touch_output("a.rlib");
         let argv = [0x11u8; 32];
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("load");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         let q_sources = vec![a.clone()];
         assert!(!cache.is_fresh(&basic_query("k", argv, &q_sources, &out)));
 
@@ -370,7 +414,7 @@ mod tests {
             .expect("mark");
         cache.save().expect("save");
 
-        let mut cache2 = Cache::load(&fx.manifest_path).expect("reload");
+        let mut cache2 = Cache::load(&fx.manifest_path).0;
         assert!(cache2.is_fresh(&basic_query("k", argv, &q_sources, &out)));
     }
 
@@ -380,7 +424,7 @@ mod tests {
         let a = fx.write("a.rs", b"x");
         let out = fx.touch_output("a.rlib");
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("load");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         cache
             .mark_built(record("k", [1u8; 32], vec![a.clone()], out.clone()))
             .expect("mark");
@@ -396,7 +440,7 @@ mod tests {
         let out = fx.touch_output("a.rlib");
         let argv = [3u8; 32];
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("load");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         cache
             .mark_built(record("k", argv, vec![a.clone()], out.clone()))
             .expect("mark");
@@ -414,7 +458,7 @@ mod tests {
         let out = fx.touch_output("a.rlib");
         let argv = [4u8; 32];
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("load");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         cache
             .mark_built(record("k", argv, vec![a.clone(), b.clone()], out.clone()))
             .expect("mark");
@@ -432,7 +476,7 @@ mod tests {
         let out = fx.touch_output("a.rlib");
         let argv = [5u8; 32];
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("load");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         cache
             .mark_built(record("k", argv, vec![a.clone(), b], out.clone()))
             .expect("mark");
@@ -448,7 +492,7 @@ mod tests {
         let out = fx.touch_output("a.rlib");
         let argv = [6u8; 32];
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("load");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         cache
             .mark_built(record("k", argv, vec![a.clone()], out.clone()))
             .expect("mark");
@@ -479,7 +523,7 @@ mod tests {
         let out = fx.touch_output("a.rlib");
         let argv = [7u8; 32];
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("load");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         cache
             .mark_built(record("k", argv, vec![a.clone()], out.clone()))
             .expect("mark");
@@ -504,14 +548,14 @@ mod tests {
         let argv = [8u8; 32];
 
         {
-            let mut cache = Cache::load(&fx.manifest_path).expect("load");
+            let mut cache = Cache::load(&fx.manifest_path).0;
             cache
                 .mark_built(record("k", argv, vec![a.clone()], out.clone()))
                 .expect("mark");
             cache.save().expect("save");
         }
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("reload");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         let sources = vec![a];
         assert!(cache.is_fresh(&basic_query("k", argv, &sources, &out)));
     }
@@ -523,7 +567,7 @@ mod tests {
         let out = fx.touch_output("a.rlib");
         let argv = [9u8; 32];
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("load");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         cache
             .mark_built(record("k", argv, vec![a], out))
             .expect("mark");
@@ -556,7 +600,7 @@ mod tests {
         let out = fx.touch_output("ab.rlib");
         let argv = [11u8; 32];
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("load");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         cache
             .mark_built(record("k", argv, vec![a.clone(), b.clone()], out.clone()))
             .expect("mark");
@@ -577,7 +621,7 @@ mod tests {
         let out = fx.touch_output("a.rlib");
         let argv = [12u8; 32];
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("load");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         cache
             .mark_built(record("k", argv, vec![a.clone()], out.clone()))
             .expect("mark");
@@ -593,13 +637,13 @@ mod tests {
         let out = fx.touch_output("a.rlib");
         let argv = [10u8; 32];
 
-        let mut cache = Cache::load(&fx.manifest_path).expect("load");
+        let mut cache = Cache::load(&fx.manifest_path).0;
         cache
             .mark_built(record("k", argv, vec![a], out))
             .expect("mark");
         cache.save().expect("save");
 
-        let leftovers: Vec<_> = fs::read_dir(&fx.root)
+        let leftovers: Vec<_> = fs::read_dir(&fx.build_dir)
             .expect("readdir")
             .filter_map(|e| e.ok())
             .filter(|e| {

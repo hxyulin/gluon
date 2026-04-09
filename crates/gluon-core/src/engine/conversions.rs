@@ -8,11 +8,8 @@ use gluon_model::{ConfigType, ConfigValue, DepDef, TristateVal};
 use rhai::{Dynamic, Map, Position};
 use std::collections::BTreeMap;
 
-// TODO: restore `optional` and `default_features` to the allowed keys
-// when DepDef gains fields for them (likely when vendor resolution lands
-// in sub-project #3).
 /// Allowed keys inside an entry of a `.deps(#{ ... })` map.
-const ALLOWED_DEP_KEYS: &[&str] = &["crate", "features", "version"];
+const ALLOWED_DEP_KEYS: &[&str] = &["crate", "default_features", "features", "optional", "version"];
 
 /// Parse a `.deps(#{ ... })` map strictly.
 ///
@@ -49,6 +46,8 @@ pub(super) fn parse_dep_map(
         let mut crate_name: Option<String> = None;
         let mut features: Vec<String> = Vec::new();
         let mut version: Option<String> = None;
+        let mut optional = false;
+        let mut default_features = true;
         let mut had_error = false;
 
         for (k, v) in &inner {
@@ -56,7 +55,7 @@ pub(super) fn parse_dep_map(
             if !ALLOWED_DEP_KEYS.contains(&ks) {
                 state.push_diagnostic(
                     Diagnostic::error(format!(
-                        "unknown dep option '{ks}' (allowed: crate, features, version)"
+                        "unknown dep option '{ks}' (allowed: crate, default_features, features, optional, version)"
                     ))
                     .with_span(span.clone()),
                 );
@@ -112,6 +111,30 @@ pub(super) fn parse_dep_map(
                         had_error = true;
                     }
                 },
+                "optional" => match v.as_bool() {
+                    Ok(b) => optional = b,
+                    Err(_) => {
+                        state.push_diagnostic(
+                            Diagnostic::error(format!(
+                                "dep '{extern_name}' field 'optional' must be a bool"
+                            ))
+                            .with_span(span.clone()),
+                        );
+                        had_error = true;
+                    }
+                },
+                "default_features" => match v.as_bool() {
+                    Ok(b) => default_features = b,
+                    Err(_) => {
+                        state.push_diagnostic(
+                            Diagnostic::error(format!(
+                                "dep '{extern_name}' field 'default_features' must be a bool"
+                            ))
+                            .with_span(span.clone()),
+                        );
+                        had_error = true;
+                    }
+                },
                 _ => unreachable!("ALLOWED_DEP_KEYS check above"),
             }
         }
@@ -142,6 +165,8 @@ pub(super) fn parse_dep_map(
                 crate_handle: None,
                 features,
                 version,
+                optional,
+                default_features,
                 span: Some(span.clone()),
             },
         );

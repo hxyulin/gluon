@@ -220,6 +220,25 @@ impl RustcInfo {
         Ok(info)
     }
 
+    /// Query the built-in `cfg` values for a given target triple by
+    /// running `rustc --print=cfg --target=<triple>`.
+    ///
+    /// Returns one entry per cfg line (e.g. `target_arch="x86_64"`,
+    /// `target_os="none"`, `unix`). Falls back to an empty `Vec` if the
+    /// target is not recognised by the host toolchain (custom target JSON
+    /// files not on the search path, exotic triples, etc.).
+    pub fn target_cfgs(&self, triple: &str) -> Vec<String> {
+        let rustc = self.rustc_path.to_string_lossy();
+        match run_rustc(&rustc, &["--print=cfg", &format!("--target={triple}")]) {
+            Ok(output) => output
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Deterministic, paths-free 32-byte fingerprint of the toolchain
     /// identity. Used as a cache-key ingredient by downstream compile
     /// steps: two `RustcInfo` values that compile to the same artefacts
