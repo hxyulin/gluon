@@ -180,31 +180,62 @@ pub fn resolve(
             let Some(opt) = model.config_options.get(name) else {
                 continue;
             };
-            if opt.depends_on.is_empty() {
-                continue;
-            }
-            let unsatisfied: Option<String> = opt
-                .depends_on
-                .iter()
-                .find(|dep| {
-                    resolved_options
-                        .get(dep.as_str())
-                        .map(|v| !is_on(v))
-                        .unwrap_or(true)
-                })
-                .cloned();
-            if let Some(dep_name) = unsatisfied {
-                let off = off_value_for(opt);
-                let cur = resolved_options.get(name);
-                if cur != Some(&off) {
-                    diags.push(
-                        Diagnostic::error(format!(
-                            "option '{name}' disabled because dependency '{dep_name}' is not satisfied"
-                        ))
-                        .with_note("depends_on forces an option to its 'off' value when any dependency is off"),
-                    );
-                    resolved_options.insert(name.clone(), off);
-                    changed = true;
+
+            // Two paths:
+            //
+            // 1. `depends_on_expr` is `Some` (populated by the .kconfig
+            //    loader). Evaluate the full boolean expression — `&&`,
+            //    `||`, `!`, grouping — against the current resolved
+            //    state. This is the only path where `A || B` and
+            //    `A && B` resolve differently.
+            //
+            // 2. Otherwise fall through to the legacy flat
+            //    `Vec<String>` path, which the Rhai builder still
+            //    populates. The flat form is implicitly an AND-of-
+            //    symbols and matches the historical behavior.
+            //
+            // Both paths force the option to its `off` value when
+            // unsatisfied; only the diagnostic message differs.
+            if let Some(expr) = &opt.depends_on_expr {
+                let lookup = |n: &str| resolved_options.get(n).map(is_on);
+                if !expr.eval(&lookup) {
+                    let off = off_value_for(opt);
+                    let cur = resolved_options.get(name);
+                    if cur != Some(&off) {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "option '{name}' disabled because its 'depends_on' expression is not satisfied"
+                            ))
+                            .with_note("depends_on_expr evaluates with `&&`/`||`/`!` semantics; check that the referenced options are set to the values you expect"),
+                        );
+                        resolved_options.insert(name.clone(), off);
+                        changed = true;
+                    }
+                }
+            } else if !opt.depends_on.is_empty() {
+                let unsatisfied: Option<String> = opt
+                    .depends_on
+                    .iter()
+                    .find(|dep| {
+                        resolved_options
+                            .get(dep.as_str())
+                            .map(|v| !is_on(v))
+                            .unwrap_or(true)
+                    })
+                    .cloned();
+                if let Some(dep_name) = unsatisfied {
+                    let off = off_value_for(opt);
+                    let cur = resolved_options.get(name);
+                    if cur != Some(&off) {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "option '{name}' disabled because dependency '{dep_name}' is not satisfied"
+                            ))
+                            .with_note("depends_on forces an option to its 'off' value when any dependency is off"),
+                        );
+                        resolved_options.insert(name.clone(), off);
+                        changed = true;
+                    }
                 }
             }
         }
@@ -761,6 +792,116 @@ mod tests {
             }
             other => panic!("expected Diagnostics, got {other:?}"),
         }
+    }
+
+    /// Helper for the K8 expression-form depends_on tests: write a
+    /// `gluon.rhai` + sibling `options.kconfig` into a tempdir, evaluate
+    /// the script, and resolve the default profile. Returns the
+    /// resolved config so each test can assert on the option states.
+    ///
+    /// The .kconfig path is what populates `depends_on_expr` — the Rhai
+    /// builder still produces only `Vec<String>` form. So this helper
+    /// is the only way to drive the new resolver branch end-to-end.
+    fn resolve_kconfig_pair(rhai: &str, kconfig: &str) -> Result<ResolvedConfig> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("gluon.rhai");
+        std::fs::write(&script, rhai).expect("write rhai");
+        std::fs::write(dir.path().join("options.kconfig"), kconfig).expect("write kconfig");
+        let model = evaluate_script(&script).expect("evaluate");
+        resolve(&model, "default", None, dir.path(), None)
+    }
+
+    #[test]
+    fn resolve_config_depends_on_expr_and_satisfied() {
+        // A && B with both A and B on → X stays at its default (true).
+        let cfg = resolve_kconfig_pair(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            profile("default").target("x");
+            load_kconfig("./options.kconfig");
+            "#,
+            r#"
+            config A: bool { default = true }
+            config B: bool { default = true }
+            config X: bool { default = true depends_on = A && B }
+            "#,
+        )
+        .expect("resolve");
+        assert_eq!(cfg.options.get("X"), Some(&ResolvedValue::Bool(true)));
+    }
+
+    #[test]
+    fn resolve_config_depends_on_expr_and_unsatisfied() {
+        // A && B but B is off → X must be forced off.
+        let cfg = resolve_kconfig_pair(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            profile("default").target("x");
+            load_kconfig("./options.kconfig");
+            "#,
+            r#"
+            config A: bool { default = true }
+            config B: bool { default = false }
+            config X: bool { default = true depends_on = A && B }
+            "#,
+        );
+        // The resolver pushes a diagnostic on the disable, so the
+        // result is Err with a Diagnostics payload — not a hard
+        // failure, but the resolver still flips X off in the model.
+        // The test just confirms the diagnostic appears.
+        match cfg {
+            Err(Error::Diagnostics(v)) => {
+                assert!(
+                    v.iter()
+                        .any(|d| d.message.contains("'depends_on' expression")),
+                    "expected expression-disable diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Diagnostics about depends_on expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_config_depends_on_expr_or_one_satisfied() {
+        // A || B with only A on → X stays satisfied. This is the case
+        // where flatten-based eval would WRONGLY disable X (because B
+        // is off and the flat form treats it as required).
+        let cfg = resolve_kconfig_pair(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            profile("default").target("x");
+            load_kconfig("./options.kconfig");
+            "#,
+            r#"
+            config A: bool { default = true }
+            config B: bool { default = false }
+            config X: bool { default = true depends_on = A || B }
+            "#,
+        )
+        .expect("resolve");
+        assert_eq!(cfg.options.get("X"), Some(&ResolvedValue::Bool(true)));
+    }
+
+    #[test]
+    fn resolve_config_depends_on_expr_not_inverts() {
+        // !DISABLED with DISABLED off → expression is true → X enabled.
+        let cfg = resolve_kconfig_pair(
+            r#"
+            project("t","1");
+            target("x","t.json");
+            profile("default").target("x");
+            load_kconfig("./options.kconfig");
+            "#,
+            r#"
+            config DISABLED: bool { default = false }
+            config X: bool { default = true depends_on = !DISABLED }
+            "#,
+        )
+        .expect("resolve");
+        assert_eq!(cfg.options.get("X"), Some(&ResolvedValue::Bool(true)));
     }
 
     #[test]

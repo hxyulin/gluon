@@ -29,7 +29,7 @@ pub enum TristateVal {
 
 /// Values that a config option can hold. Note: `ConfigType::Group` is purely
 /// structural — group-typed options never carry a value directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConfigValue {
     Bool(bool),
     Tristate(TristateVal),
@@ -82,6 +82,19 @@ pub struct ConfigOptionDef {
     pub visible_if: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceSpan>,
+    /// Parsed boolean expression form of `depends_on`, populated by the
+    /// `.kconfig` loader (not by the Rhai builder). When `Some`, the
+    /// resolver evaluates this expression instead of the flat
+    /// `depends_on` `Vec<String>` — the expression form is strictly more
+    /// expressive (supports `||`, `!`, and grouping) whereas the flat
+    /// form is an implicit AND-of-symbols. See `Expr::eval`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on_expr: Option<Expr>,
+    /// Parsed boolean expression form of `visible_if`. TUI-only today —
+    /// validated for undeclared references but not evaluated by the
+    /// resolver. Populated by the `.kconfig` loader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_if_expr: Option<Expr>,
 }
 
 /// A named configuration preset.
@@ -91,4 +104,201 @@ pub struct PresetDef {
     pub inherits: Option<String>,
     pub help: Option<String>,
     pub overrides: BTreeMap<String, ConfigValue>,
+}
+
+/// A boolean expression over config option identifiers.
+///
+/// Used as the parsed form of `depends_on` and `visible_if` clauses when
+/// loaded from a `.kconfig` file. At resolve time the expression is
+/// evaluated against the current option state — an `Ident` is "true" iff
+/// the referenced option is enabled (per the same `is_on` predicate the
+/// resolver already uses for the flat `Vec<String>` depends form).
+///
+/// `ConfigOptionDef` keeps the flat `Vec<String>` fields alongside these
+/// optional expressions so the Rhai builder — which only knows how to
+/// produce flat dependency lists — continues to work unchanged. When the
+/// expression form is present it takes precedence at resolve time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Expr {
+    /// Reference to another option by name. Evaluates to the value of
+    /// that option's `is_on` predicate; missing options evaluate to false.
+    Ident(String),
+    /// Literal boolean. Parseable from `true` / `false` in `.kconfig`.
+    Const(bool),
+    Not(Box<Expr>),
+    /// Conjunction. `And(vec![])` is vacuously true.
+    And(Vec<Expr>),
+    /// Disjunction. `Or(vec![])` is vacuously false.
+    Or(Vec<Expr>),
+}
+
+impl Expr {
+    /// Evaluate the expression against a lookup of "is this option on?".
+    ///
+    /// `lookup` returns `Some(true)` if the option is enabled,
+    /// `Some(false)` if it is declared but off, and `None` if it is not
+    /// declared at all. Missing options are treated as off — matching the
+    /// conservative semantics of the flat `Vec<String>` depends path in
+    /// `config::resolve`.
+    pub fn eval<F>(&self, lookup: &F) -> bool
+    where
+        F: Fn(&str) -> Option<bool>,
+    {
+        match self {
+            Expr::Ident(name) => lookup(name).unwrap_or(false),
+            Expr::Const(b) => *b,
+            Expr::Not(inner) => !inner.eval(lookup),
+            Expr::And(xs) => xs.iter().all(|x| x.eval(lookup)),
+            Expr::Or(xs) => xs.iter().any(|x| x.eval(lookup)),
+        }
+    }
+
+    /// Collect every option identifier referenced anywhere in the
+    /// expression tree, in left-to-right traversal order. Used by the
+    /// loader's validation pass to check that every symbol a
+    /// `depends_on` / `visible_if` mentions is actually declared.
+    ///
+    /// Duplicates are preserved — callers that want a set should
+    /// deduplicate themselves.
+    pub fn referenced_idents<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Expr::Ident(name) => out.push(name.as_str()),
+            Expr::Const(_) => {}
+            Expr::Not(inner) => inner.referenced_idents(out),
+            Expr::And(xs) | Expr::Or(xs) => {
+                for x in xs {
+                    x.referenced_idents(out);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a lookup closure from a slice of (name, on) pairs. Missing
+    /// names return `None`, matching how resolver-state lookups behave.
+    fn lookup_from(pairs: &[(&str, bool)]) -> impl Fn(&str) -> Option<bool> {
+        let map: BTreeMap<String, bool> =
+            pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect();
+        move |name: &str| map.get(name).copied()
+    }
+
+    #[test]
+    fn expr_ident_reads_lookup() {
+        let l = lookup_from(&[("A", true), ("B", false)]);
+        assert!(Expr::Ident("A".into()).eval(&l));
+        assert!(!Expr::Ident("B".into()).eval(&l));
+        // Missing identifier is treated as off, not an error — this
+        // matches the existing flat-Vec<String> depends_on semantics at
+        // config::resolve::resolve where `.unwrap_or(true)` on a missing
+        // option treats it as unsatisfied.
+        assert!(!Expr::Ident("MISSING".into()).eval(&l));
+    }
+
+    #[test]
+    fn expr_const_is_literal() {
+        let l = lookup_from(&[]);
+        assert!(Expr::Const(true).eval(&l));
+        assert!(!Expr::Const(false).eval(&l));
+    }
+
+    #[test]
+    fn expr_not_inverts() {
+        let l = lookup_from(&[("A", true)]);
+        assert!(!Expr::Not(Box::new(Expr::Ident("A".into()))).eval(&l));
+        assert!(Expr::Not(Box::new(Expr::Ident("MISSING".into()))).eval(&l));
+    }
+
+    #[test]
+    fn expr_and_short_circuits() {
+        let l = lookup_from(&[("A", true), ("B", true), ("C", false)]);
+        assert!(Expr::And(vec![Expr::Ident("A".into()), Expr::Ident("B".into())]).eval(&l));
+        assert!(!Expr::And(vec![Expr::Ident("A".into()), Expr::Ident("C".into())]).eval(&l));
+        // Empty AND is vacuously true — matches mathematical convention
+        // and means `depends_on = []` imposes no constraint.
+        assert!(Expr::And(vec![]).eval(&l));
+    }
+
+    #[test]
+    fn expr_or_short_circuits() {
+        let l = lookup_from(&[("A", false), ("B", true), ("C", false)]);
+        assert!(Expr::Or(vec![Expr::Ident("A".into()), Expr::Ident("B".into())]).eval(&l));
+        assert!(!Expr::Or(vec![Expr::Ident("A".into()), Expr::Ident("C".into())]).eval(&l));
+        // Empty OR is vacuously false.
+        assert!(!Expr::Or(vec![]).eval(&l));
+    }
+
+    #[test]
+    fn expr_semantics_differ_from_flatten() {
+        // This is the whole reason we went with true semantic evaluation
+        // instead of hadron's flatten_symbols() approach: `A || B` and
+        // `A && B` must produce different answers when only one of A/B
+        // is on. A flatten-based implementation would see the same
+        // {A, B} symbol set in both and resolve them identically.
+        let l = lookup_from(&[("A", true), ("B", false)]);
+        let a_or_b = Expr::Or(vec![Expr::Ident("A".into()), Expr::Ident("B".into())]);
+        let a_and_b = Expr::And(vec![Expr::Ident("A".into()), Expr::Ident("B".into())]);
+        assert!(a_or_b.eval(&l));
+        assert!(!a_and_b.eval(&l));
+    }
+
+    #[test]
+    fn expr_nested_not_and_or() {
+        // !A && (B || C): with A=false, B=false, C=true → true.
+        let l = lookup_from(&[("A", false), ("B", false), ("C", true)]);
+        let e = Expr::And(vec![
+            Expr::Not(Box::new(Expr::Ident("A".into()))),
+            Expr::Or(vec![Expr::Ident("B".into()), Expr::Ident("C".into())]),
+        ]);
+        assert!(e.eval(&l));
+    }
+
+    #[test]
+    fn referenced_idents_walks_tree() {
+        // !A && (B || C) should yield [A, B, C] in traversal order.
+        let e = Expr::And(vec![
+            Expr::Not(Box::new(Expr::Ident("A".into()))),
+            Expr::Or(vec![Expr::Ident("B".into()), Expr::Ident("C".into())]),
+        ]);
+        let mut out = Vec::new();
+        e.referenced_idents(&mut out);
+        assert_eq!(out, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn referenced_idents_skips_const() {
+        // Const literals contribute no identifiers.
+        let e = Expr::Or(vec![Expr::Const(true), Expr::Ident("X".into())]);
+        let mut out = Vec::new();
+        e.referenced_idents(&mut out);
+        assert_eq!(out, vec!["X"]);
+    }
+
+    #[test]
+    fn config_option_def_carries_optional_expr_fields() {
+        // depends_on_expr / visible_if_expr default to None and the
+        // existing Vec<String> paths remain the primary form until the
+        // .kconfig loader populates the expression form.
+        let opt = ConfigOptionDef {
+            name: "X".into(),
+            ty: ConfigType::Bool,
+            default: ConfigValue::Bool(false),
+            help: None,
+            depends_on: vec![],
+            selects: vec![],
+            range: None,
+            choices: None,
+            menu: None,
+            bindings: vec![],
+            visible_if: vec![],
+            span: None,
+            depends_on_expr: None,
+            visible_if_expr: None,
+        };
+        assert!(opt.depends_on_expr.is_none());
+        assert!(opt.visible_if_expr.is_none());
+    }
 }

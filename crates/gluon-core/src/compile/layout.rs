@@ -9,6 +9,7 @@
 //! layout in one place, so later reorganisation (e.g. sharding by target,
 //! adding a content-addressed store) only has to touch one file.
 
+use super::driver::DriverKind;
 use gluon_model::{CrateDef, ResolvedProfile, TargetDef};
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,27 @@ use std::path::{Path, PathBuf};
 /// All getters return computed paths; none of them touch the filesystem.
 /// Callers are responsible for creating directories on demand (typically
 /// the compile step just before it writes into a given path).
+///
+/// # Per-driver namespacing
+///
+/// User-crate output directories are partitioned by the active
+/// [`DriverKind`] so that `gluon check` and `gluon clippy` cannot
+/// clobber `gluon build` artifacts (and vice versa). Concretely:
+///
+/// - `DriverKind::Rustc` (the default for `gluon build`) keeps the
+///   historical paths: `<root>/host/<crate>/`,
+///   `<root>/cross/<target>/<profile>/<crate>/`, etc.
+/// - `DriverKind::Check` writes under `<root>/tool/check/...`.
+/// - `DriverKind::Clippy` writes under `<root>/tool/clippy/...`.
+///
+/// **Sysroot, generated config crate, and the cache manifest are
+/// deliberately *not* partitioned.** The sysroot is built with regular
+/// rustc regardless of the user-facing driver, so re-running it for
+/// every check/clippy invocation would just waste time. The config
+/// crate is similarly driver-agnostic. The cache manifest can safely
+/// be shared because [`super::rustc::RustcCommandBuilder::hash`]
+/// already incorporates the program path and `--emit` kinds, so
+/// driver-specific entries cannot collide on key.
 #[derive(Debug, Clone)]
 pub struct BuildLayout {
     /// Absolute or relative root under which every derived path lives.
@@ -24,24 +46,59 @@ pub struct BuildLayout {
     root: PathBuf,
     /// Project name used to derive the generated config crate directory.
     project_name: String,
+    /// Active driver kind. Determines whether user-crate output paths
+    /// get a `tool/<kind>/` prefix or use the historical `gluon build`
+    /// layout. Defaults to [`DriverKind::Rustc`].
+    driver: DriverKind,
 }
 
 impl BuildLayout {
-    /// Construct a new layout rooted at `root`.
-    ///
-    /// `root` is the directory every derived path is relative to — this
-    /// type does **not** implicitly append `build/`. Pass whatever root the
-    /// caller wants artefacts to live under (e.g. `<project>/build`).
+    /// Construct a new layout rooted at `root` for the default
+    /// `gluon build` driver. Existing call sites continue to work
+    /// unchanged and observe the historical path layout.
     pub fn new(root: impl Into<PathBuf>, project_name: impl Into<String>) -> Self {
+        Self::with_driver(root, project_name, DriverKind::Rustc)
+    }
+
+    /// Construct a new layout for an explicit driver. Used by
+    /// `gluon check` and `gluon clippy` so their output goes under
+    /// `tool/check/` / `tool/clippy/` instead of clobbering build
+    /// artifacts.
+    pub fn with_driver(
+        root: impl Into<PathBuf>,
+        project_name: impl Into<String>,
+        driver: DriverKind,
+    ) -> Self {
         Self {
             root: root.into(),
             project_name: project_name.into(),
+            driver,
         }
+    }
+
+    /// Return the active driver. Used by `compile_crate` to pick the
+    /// program binary and emit overrides; not normally relevant to
+    /// path computation by external callers.
+    pub fn driver(&self) -> DriverKind {
+        self.driver
     }
 
     /// The build root.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The base directory under which **user-crate** outputs live for
+    /// the active driver. Returns the build root for `Rustc` and
+    /// `<root>/tool/<kind>` for `Check`/`Clippy`. Sysroot and config
+    /// crate paths intentionally do not route through this helper —
+    /// they always use the bare root.
+    fn user_crate_root(&self) -> PathBuf {
+        match self.driver {
+            DriverKind::Rustc => self.root.clone(),
+            DriverKind::Check => self.root.join("tool").join("check"),
+            DriverKind::Clippy => self.root.join("tool").join("clippy"),
+        }
     }
 
     /// Path to the top-level cache manifest (`<root>/cache-manifest.json`).
@@ -74,30 +131,38 @@ impl BuildLayout {
         self.sysroot_dir(target).join("stamp")
     }
 
-    /// Per-host-crate artifact directory (`<root>/host/<crate>/`).
+    /// Per-host-crate artifact directory.
+    ///
+    /// `gluon build`: `<root>/host/<crate>/`.
+    /// `gluon check`: `<root>/tool/check/host/<crate>/`.
+    /// `gluon clippy`: `<root>/tool/clippy/host/<crate>/`.
     pub fn host_artifact_dir(&self, krate: &CrateDef) -> PathBuf {
-        self.root.join("host").join(&krate.name)
+        self.user_crate_root().join("host").join(&krate.name)
     }
 
-    /// Per-cross-crate artifact directory
-    /// (`<root>/cross/<target>/<profile>/<crate>/`).
+    /// Per-cross-crate artifact directory.
+    ///
+    /// `gluon build`: `<root>/cross/<target>/<profile>/<crate>/`.
+    /// `gluon check`/`clippy`: same path under `<root>/tool/<kind>/`.
     pub fn cross_artifact_dir(
         &self,
         target: &TargetDef,
         profile: &ResolvedProfile,
         krate: &CrateDef,
     ) -> PathBuf {
-        self.root
+        self.user_crate_root()
             .join("cross")
             .join(&target.name)
             .join(&profile.name)
             .join(&krate.name)
     }
 
-    /// Final link/image output directory for a (target, profile) pair
-    /// (`<root>/cross/<target>/<profile>/final/`).
+    /// Final link/image output directory for a (target, profile) pair.
+    ///
+    /// `gluon build`: `<root>/cross/<target>/<profile>/final/`.
+    /// `gluon check`/`clippy`: same path under `<root>/tool/<kind>/`.
     pub fn cross_final_dir(&self, target: &TargetDef, profile: &ResolvedProfile) -> PathBuf {
-        self.root
+        self.user_crate_root()
             .join("cross")
             .join(&target.name)
             .join(&profile.name)
@@ -115,10 +180,14 @@ impl BuildLayout {
             .join(format!("{}_config", self.project_name))
     }
 
-    /// Per-crate incremental compilation directory
-    /// (`<root>/incremental/<crate>/`).
+    /// Per-crate incremental compilation directory.
+    ///
+    /// `gluon build`: `<root>/incremental/<crate>/`.
+    /// `gluon check`/`clippy`: under `<root>/tool/<kind>/incremental/<crate>/`
+    /// — separate so the metadata-only and full-build incremental
+    /// state don't trample each other.
     pub fn incremental_dir(&self, krate: &CrateDef) -> PathBuf {
-        self.root.join("incremental").join(&krate.name)
+        self.user_crate_root().join("incremental").join(&krate.name)
     }
 
     /// Cache file for the probed [`super::RustcInfo`]
@@ -242,6 +311,104 @@ mod tests {
             layout().rustc_info_cache(),
             PathBuf::from("/tmp/fake/.rustc-info.json")
         );
+    }
+
+    // ---------------------------------------------------------------
+    // T3: per-driver namespacing
+    // ---------------------------------------------------------------
+
+    fn check_layout() -> BuildLayout {
+        BuildLayout::with_driver("/tmp/fake", "demo", DriverKind::Check)
+    }
+
+    fn clippy_layout() -> BuildLayout {
+        BuildLayout::with_driver("/tmp/fake", "demo", DriverKind::Clippy)
+    }
+
+    #[test]
+    fn check_driver_namespaces_user_crate_dirs_under_tool_check() {
+        let l = check_layout();
+        assert_eq!(
+            l.host_artifact_dir(&krate()),
+            PathBuf::from("/tmp/fake/tool/check/host/kernel")
+        );
+        assert_eq!(
+            l.cross_artifact_dir(&target(), &profile(), &krate()),
+            PathBuf::from("/tmp/fake/tool/check/cross/x86_64-test/debug/kernel")
+        );
+        assert_eq!(
+            l.cross_final_dir(&target(), &profile()),
+            PathBuf::from("/tmp/fake/tool/check/cross/x86_64-test/debug/final")
+        );
+        assert_eq!(
+            l.incremental_dir(&krate()),
+            PathBuf::from("/tmp/fake/tool/check/incremental/kernel")
+        );
+    }
+
+    #[test]
+    fn clippy_driver_namespaces_user_crate_dirs_under_tool_clippy() {
+        let l = clippy_layout();
+        assert_eq!(
+            l.host_artifact_dir(&krate()),
+            PathBuf::from("/tmp/fake/tool/clippy/host/kernel")
+        );
+    }
+
+    #[test]
+    fn rustc_driver_keeps_historical_paths() {
+        // Default `BuildLayout::new` must produce the same paths as
+        // before T3 — anything else would silently break gluon build.
+        let l = layout();
+        assert_eq!(
+            l.host_artifact_dir(&krate()),
+            PathBuf::from("/tmp/fake/host/kernel"),
+            "Rustc driver must keep historical layout"
+        );
+        assert_eq!(
+            l.cross_artifact_dir(&target(), &profile(), &krate()),
+            PathBuf::from("/tmp/fake/cross/x86_64-test/debug/kernel")
+        );
+    }
+
+    #[test]
+    fn sysroot_paths_are_shared_across_drivers() {
+        // Sysroot must NOT vary by driver — check/clippy reuse the
+        // sysroot built by gluon build (and vice versa). This is the
+        // whole reason we don't put a per-driver prefix on
+        // `sysroot_dir`.
+        let rustc = layout();
+        let check = check_layout();
+        let clippy = clippy_layout();
+        let t = target();
+        assert_eq!(rustc.sysroot_dir(&t), check.sysroot_dir(&t));
+        assert_eq!(rustc.sysroot_dir(&t), clippy.sysroot_dir(&t));
+    }
+
+    #[test]
+    fn cache_manifest_and_config_crate_paths_are_shared_across_drivers() {
+        // Same rationale as sysroot: cache hashes already discriminate
+        // between driver-flavored entries via program path + emit
+        // kinds, so the manifest can safely be shared. The generated
+        // config crate is identical for build/check/clippy.
+        let rustc = layout();
+        let check = check_layout();
+        assert_eq!(rustc.cache_manifest(), check.cache_manifest());
+        assert_eq!(
+            rustc.generated_config_crate_dir(),
+            check.generated_config_crate_dir()
+        );
+    }
+
+    #[test]
+    fn check_and_build_user_crate_dirs_do_not_collide() {
+        // The whole point of T3: running gluon check then gluon build
+        // (or vice versa) must not let one's `.rmeta` clobber the
+        // other's `.rlib` in the same directory.
+        let rustc = layout();
+        let check = check_layout();
+        let k = krate();
+        assert_ne!(rustc.host_artifact_dir(&k), check.host_artifact_dir(&k));
     }
 
     #[test]

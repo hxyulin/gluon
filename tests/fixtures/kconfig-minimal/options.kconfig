@@ -1,0 +1,30 @@
+# Top-level options used by the K9 round-trip parity test.
+# Mirrors `kconfig-rhai-equiv/gluon.rhai` exactly for the AND-of-symbols
+# subset; the OR / NOT / preset features below are exercised separately.
+
+config LOG_ENABLED: bool {
+    default = true
+    help = "Enable runtime logging"
+}
+
+config LOG_LEVEL: u32 {
+    default = 3
+    range = 0..=5
+    depends_on = LOG_ENABLED
+}
+
+config DEBUG: bool {
+    default = false
+}
+
+# Pull in additional options from a sibling file to exercise the
+# `source` directive end-to-end.
+source "./extras.kconfig"
+
+# A preset that overrides a couple of options. The parity test loads
+# the resolver with this preset selected and asserts the values match
+# the Rhai equivalent.
+preset "verbose" {
+    LOG_LEVEL = 5
+    DEBUG = true
+}

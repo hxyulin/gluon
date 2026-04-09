@@ -871,6 +871,146 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // K7: load_kconfig() integration
+    // -----------------------------------------------------------------
+
+    /// Write `gluon.rhai` and a sibling `.kconfig` into a fresh tempdir,
+    /// returning the directory and the script path. Used by the
+    /// load_kconfig integration tests because they need a real
+    /// filesystem layout (the loader resolves paths relative to the
+    /// script directory).
+    fn write_pair(
+        rhai: &str,
+        kconfig_files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("gluon.rhai");
+        std::fs::write(&script, rhai).expect("write rhai");
+        for (name, body) in kconfig_files {
+            std::fs::write(dir.path().join(name), body).expect("write kconfig");
+        }
+        (dir, script)
+    }
+
+    #[test]
+    fn load_kconfig_basic_loads_options_into_model() {
+        let (_dir, script) = write_pair(
+            r#"
+            project("t", "0.1.0");
+            load_kconfig("./options.kconfig");
+            "#,
+            &[("options.kconfig", "config DEBUG: bool { default = true }")],
+        );
+        let model = evaluate_script(&script).expect("script must evaluate");
+        let opt = model
+            .config_options
+            .get("DEBUG")
+            .expect("DEBUG option loaded");
+        assert_eq!(opt.ty, gluon_model::ConfigType::Bool);
+        match opt.default {
+            gluon_model::ConfigValue::Bool(true) => {}
+            ref other => panic!("expected Bool(true), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_kconfig_populates_depends_on_expr() {
+        let (_dir, script) = write_pair(
+            r#"
+            project("t", "0.1.0");
+            load_kconfig("./options.kconfig");
+            "#,
+            &[(
+                "options.kconfig",
+                r#"
+                config A: bool { default = true }
+                config B: bool { default = false }
+                config X: bool { depends_on = A && !B }
+                "#,
+            )],
+        );
+        let model = evaluate_script(&script).expect("script must evaluate");
+        let x = model.config_options.get("X").unwrap();
+        assert!(x.depends_on_expr.is_some());
+        // Sanity-evaluate the parsed expression with both A=on, B=off →
+        // should be true.
+        let expr = x.depends_on_expr.as_ref().unwrap();
+        let lookup = |n: &str| match n {
+            "A" => Some(true),
+            "B" => Some(false),
+            _ => None,
+        };
+        assert!(expr.eval(&lookup));
+    }
+
+    #[test]
+    fn load_kconfig_supports_source_directive() {
+        let (_dir, script) = write_pair(
+            r#"
+            project("t", "0.1.0");
+            load_kconfig("./root.kconfig");
+            "#,
+            &[
+                ("root.kconfig", r#"source "./sub.kconfig""#),
+                ("sub.kconfig", "config FROM_SUB: bool {}"),
+            ],
+        );
+        let model = evaluate_script(&script).expect("script must evaluate");
+        assert!(model.config_options.contains_key("FROM_SUB"));
+    }
+
+    #[test]
+    fn load_kconfig_conflicting_with_rhai_is_diagnosed() {
+        let (_dir, script) = write_pair(
+            r#"
+            project("t", "0.1.0");
+            config_bool("CONFLICT").default_value(false);
+            load_kconfig("./options.kconfig");
+            "#,
+            &[(
+                "options.kconfig",
+                "config CONFLICT: bool { default = true }",
+            )],
+        );
+        let err = evaluate_script(&script).expect_err("should diagnose conflict");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter()
+                        .any(|d| d.message.contains("conflicts with an existing declaration")),
+                    "expected conflict diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_kconfig_missing_file_is_diagnosed() {
+        let (_dir, script) = write_pair(
+            r#"
+            project("t", "0.1.0");
+            load_kconfig("./does_not_exist.kconfig");
+            "#,
+            &[],
+        );
+        let err = evaluate_script(&script).expect_err("should fail");
+        match err {
+            Error::Diagnostics(v) => {
+                assert!(
+                    v.iter().any(|d| d.message.contains("load_kconfig")),
+                    "expected load_kconfig diagnostic, got: {v:?}"
+                );
+                assert!(
+                    v.iter().any(|d| d.message.contains("could not open")),
+                    "expected open-error diagnostic, got: {v:?}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+
     // TODO: test pipeline rule resolution when PipelineStep.rule has a
     // script-facing setter (currently the rhai pipeline builder does not
     // expose one, so there's no way to construct an invalid reference).

@@ -13,6 +13,8 @@ pub mod compile;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod fmt;
+pub mod kconfig;
 pub mod project_root;
 pub mod rule;
 pub mod scheduler;
@@ -20,8 +22,8 @@ pub mod sysroot;
 
 pub use cache::{BuildRecord, Cache, CacheLock, CacheManifest, FreshnessQuery};
 pub use compile::{
-    ArtifactMap, BuildLayout, CompileCrateInput, CompileCtx, Emit, RustcCommandBuilder, RustcInfo,
-    compile_crate,
+    ArtifactMap, BuildLayout, CompileCrateInput, CompileCtx, DriverKind, Emit, RustcCommandBuilder,
+    RustcInfo, compile_crate,
 };
 pub use error::{Diagnostic, Error, Level, Result};
 pub use project_root::find_project_root;
@@ -137,6 +139,58 @@ pub fn build_with_workers(
         .map_err(|_| Error::Config("cache mutex poisoned".into()))?
         .save()?;
     Ok(summary)
+}
+
+/// Run the compile pipeline as a `gluon check` (metadata-only) pass.
+///
+/// Equivalent to [`build_with_workers`] except the caller is required
+/// to construct `ctx` with a [`BuildLayout`] whose driver is
+/// [`DriverKind::Check`]. The layout drives:
+///
+/// - the `--emit=metadata,dep-info` override on every per-crate rustc
+///   invocation (suppressing codegen and link),
+/// - the `tool/check/` subdirectory namespace for output, so the run
+///   does not clobber a parallel `gluon build` cache.
+///
+/// The sysroot, generated config crate, and cache manifest are
+/// deliberately shared with `gluon build` — running check after build
+/// (or vice versa) hits a hot sysroot cache and never invalidates the
+/// other tool's freshness records.
+pub fn check_with_workers(
+    ctx: &CompileCtx,
+    model: &BuildModel,
+    resolved: &ResolvedConfig,
+    workers: usize,
+) -> Result<BuildSummary> {
+    debug_assert_eq!(
+        ctx.driver(),
+        DriverKind::Check,
+        "check_with_workers requires a CompileCtx whose layout was constructed with DriverKind::Check"
+    );
+    build_with_workers(ctx, model, resolved, workers)
+}
+
+/// Run the compile pipeline as a `gluon clippy` (clippy-driver +
+/// metadata-only) pass.
+///
+/// Same contract as [`check_with_workers`], except the layout's driver
+/// must be [`DriverKind::Clippy`]. That selects `clippy-driver` as the
+/// program path (resolved via `$CLIPPY_DRIVER` → sibling-of-rustc →
+/// PATH), keeps the metadata-only emit, and routes user-crate output
+/// under `tool/clippy/` so clippy artifacts never collide with build
+/// or check artifacts.
+pub fn clippy_with_workers(
+    ctx: &CompileCtx,
+    model: &BuildModel,
+    resolved: &ResolvedConfig,
+    workers: usize,
+) -> Result<BuildSummary> {
+    debug_assert_eq!(
+        ctx.driver(),
+        DriverKind::Clippy,
+        "clippy_with_workers requires a CompileCtx whose layout was constructed with DriverKind::Clippy"
+    );
+    build_with_workers(ctx, model, resolved, workers)
 }
 
 /// Remove the gluon build directory.

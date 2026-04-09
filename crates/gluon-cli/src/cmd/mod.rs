@@ -6,10 +6,13 @@
 //! manifest, and construct a `CompileCtx`. Two entry points are
 //! provided here:
 //!
-//! - [`build_context_at`] does the full wiring including the rustc
-//!   probe. Used by `build` and `configure`, both of which genuinely
-//!   need rustc metadata (for sysroot compilation and for the
-//!   analyzer's `rust_src` field respectively).
+//! - [`build_context_at_for_driver`] does the full wiring including the
+//!   rustc probe. Used by `build`, `check`, `clippy`, and `configure`
+//!   — all of which genuinely need rustc metadata (for sysroot
+//!   compilation, the metadata-only check pass, the lint pass, and the
+//!   analyzer's `rust_src` field respectively). The driver flag flows
+//!   down into [`gluon_core::BuildLayout`] so each command's output
+//!   lands in its own subdirectory namespace.
 //!
 //! - [`build_layout_context_at`] stops just before the rustc probe
 //!   and returns only the layout + project root. Used by `clean`,
@@ -24,9 +27,12 @@
 //! wrapper reads the real cwd and delegates.
 
 pub mod build;
+pub mod check;
 pub mod clean;
+pub mod clippy;
 pub mod configure;
 pub mod external;
+pub mod fmt;
 
 use anyhow::{Context, Result};
 use gluon_core::config::{
@@ -35,7 +41,8 @@ use gluon_core::config::{
 };
 use gluon_core::model::{BuildModel, ResolvedConfig};
 use gluon_core::{
-    BuildLayout, Cache, CompileCtx, RustcInfo, evaluate, find_project_root, resolve_config,
+    BuildLayout, Cache, CompileCtx, DriverKind, RustcInfo, evaluate, find_project_root,
+    resolve_config,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,26 +72,45 @@ pub struct CmdContext {
 }
 
 /// Build a [`CmdContext`] by walking up from the host's current
-/// directory. Thin wrapper around [`build_context_at`].
+/// directory. Thin wrapper around [`build_context_at_for_driver`]; the resulting
+/// context uses [`DriverKind::Rustc`] (i.e. the historical `gluon build`
+/// layout). For `gluon check` / `gluon clippy`, use
+/// [`build_context_for_driver`] instead.
 pub fn build_context(
     profile: Option<&str>,
     target: Option<&str>,
     config_file: Option<&Path>,
 ) -> Result<CmdContext> {
-    let cwd = std::env::current_dir().context("failed to read current directory")?;
-    build_context_at(&cwd, profile, target, config_file)
+    build_context_for_driver(profile, target, config_file, DriverKind::Rustc)
 }
 
-/// Build a [`CmdContext`] starting the project-root search at `cwd`.
+/// Build a [`CmdContext`] for an explicit driver. This is the entry
+/// point used by `gluon check` and `gluon clippy`: the driver
+/// determines whether the layout's user-crate output dirs land under
+/// the historical paths or under `tool/check/` / `tool/clippy/`.
+pub fn build_context_for_driver(
+    profile: Option<&str>,
+    target: Option<&str>,
+    config_file: Option<&Path>,
+    driver: DriverKind,
+) -> Result<CmdContext> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    build_context_at_for_driver(&cwd, profile, target, config_file, driver)
+}
+
+/// Build a [`CmdContext`] starting the project-root search at `cwd`,
+/// using the requested driver flavor.
 ///
-/// Split out from [`build_context`] for testability: tests pass a
-/// tempdir directly rather than mutating `std::env::set_current_dir`,
-/// which would race with other tests in the same process.
-pub fn build_context_at(
+/// Both axes are needed for the check/clippy commands to share
+/// behavior with the existing build/configure tests, since the
+/// integration tests parameterize on cwd (tempdir) and the new
+/// commands parameterize on driver.
+pub fn build_context_at_for_driver(
     cwd: &Path,
     profile: Option<&str>,
     target: Option<&str>,
     config_file: Option<&Path>,
+    driver: DriverKind,
 ) -> Result<CmdContext> {
     let LayoutContext {
         model,
@@ -92,6 +118,19 @@ pub fn build_context_at(
         layout,
         project_root,
     } = build_layout_context_at(cwd, profile, target, config_file)?;
+
+    // Re-flavor the layout for the requested driver. The shared
+    // `build_layout_context_at` constructs a Rustc-flavored layout by
+    // default; for check/clippy we need to swap in a layout whose
+    // user-crate path methods route under `tool/<driver>/`. Sysroot,
+    // cache manifest, and config crate paths are unchanged because
+    // they don't reference the user-crate root — see `BuildLayout`'s
+    // doc comment for the rationale.
+    let layout = BuildLayout::with_driver(
+        layout.root().to_path_buf(),
+        resolved.project.name.clone(),
+        driver,
+    );
 
     let rustc_info = Arc::new(
         RustcInfo::load_or_probe(&layout).context("failed to load or probe rustc metadata")?,
@@ -123,7 +162,7 @@ pub struct LayoutContext {
 ///
 /// Used by `clean` so that a user with a broken or missing toolchain
 /// can still wipe the build directory. `build` and `configure` go
-/// through [`build_context_at`] instead because they need the rustc
+/// through [`build_context_at_for_driver`] instead because they need the rustc
 /// probe — `build` for sysroot compilation, `configure` for the
 /// analyzer's `rust_src` field.
 pub fn build_layout_context_at(
@@ -262,7 +301,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_min_script(tmp.path());
 
-        let cmd = build_context_at(tmp.path(), None, None, None).expect("build_context_at");
+        let cmd = build_context_at_for_driver(
+            tmp.path(),
+            None,
+            None,
+            None,
+            gluon_core::DriverKind::Rustc,
+        )
+        .expect("build_context_at_for_driver");
         assert_eq!(cmd.resolved.project.name, "demo");
         assert_eq!(cmd.resolved.profile.name, "dev");
         // project_root should be the tempdir (canonicalized by find_project_root).
@@ -287,7 +333,14 @@ mod tests {
             profile("alpha").target("x86_64-unknown-none");
         "#;
         fs::write(tmp.path().join("gluon.rhai"), script).expect("write");
-        let cmd = build_context_at(tmp.path(), None, None, None).expect("build_context_at");
+        let cmd = build_context_at_for_driver(
+            tmp.path(),
+            None,
+            None,
+            None,
+            gluon_core::DriverKind::Rustc,
+        )
+        .expect("build_context_at_for_driver");
         assert_eq!(cmd.resolved.profile.name, "alpha");
     }
 }

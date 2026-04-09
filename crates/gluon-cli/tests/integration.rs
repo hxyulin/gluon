@@ -428,3 +428,269 @@ fn gluon_clean_keep_sysroot_preserves_sysroot() {
         "non-sysroot build state should have been removed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// T7: gluon check / clippy / fmt
+// ---------------------------------------------------------------------------
+
+/// Cold `gluon check` should succeed and report a non-zero "checked N"
+/// summary; the second invocation should hit the cache.
+#[test]
+#[ignore]
+fn gluon_check_cold_then_cache_hit() {
+    let Some(()) = require_rustc_or_skip("gluon_check_cold_then_cache_hit") else {
+        return;
+    };
+    let (_tmp, fixture) = setup_fixture();
+
+    let first = gluon_command(&fixture)
+        .arg("check")
+        .output()
+        .expect("spawn first gluon check");
+    let first_stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first.status.success(),
+        "first check failed: status={:?}, stderr=\n{first_stderr}",
+        first.status
+    );
+    assert!(
+        first_stderr.contains("checked ") && first_stderr.contains("cached 0"),
+        "first check summary should be 'checked N, cached 0', got: {first_stderr}"
+    );
+
+    // Output should land under build/tool/check/, not under the
+    // historical paths used by `gluon build`.
+    let check_root = fixture.join("build").join("tool").join("check");
+    assert!(
+        check_root.is_dir(),
+        "expected build/tool/check/ to exist after `gluon check`, fixture: {fixture:?}"
+    );
+
+    let second = gluon_command(&fixture)
+        .arg("check")
+        .output()
+        .expect("spawn second gluon check");
+    let second_stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second.status.success(),
+        "second check failed: {second_stderr}"
+    );
+    assert!(
+        second_stderr.contains("checked 0"),
+        "second check should report 'checked 0', got: {second_stderr}"
+    );
+    assert!(
+        second_stderr.contains("cached ") && !second_stderr.contains("cached 0"),
+        "second check should report non-zero 'cached N', got: {second_stderr}"
+    );
+}
+
+/// Running `gluon check` after a successful `gluon build` must NOT
+/// invalidate the build's cache. The second build run should still be
+/// fully cached. This is the regression guard for T3 (cache
+/// namespacing).
+#[test]
+#[ignore]
+fn gluon_check_after_build_does_not_wipe_build_cache() {
+    let Some(()) = require_rustc_or_skip("gluon_check_after_build_does_not_wipe_build_cache")
+    else {
+        return;
+    };
+    let (_tmp, fixture) = setup_fixture();
+
+    // 1. Cold build.
+    let build1 = gluon_command(&fixture)
+        .arg("build")
+        .output()
+        .expect("spawn build #1");
+    assert!(
+        build1.status.success(),
+        "build #1 failed: {}",
+        String::from_utf8_lossy(&build1.stderr)
+    );
+
+    // 2. Run check. Should produce its own artifacts under tool/check/.
+    let check = gluon_command(&fixture)
+        .arg("check")
+        .output()
+        .expect("spawn check");
+    assert!(
+        check.status.success(),
+        "check after build failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    // 3. Re-run build. Must be fully cached.
+    let build2 = gluon_command(&fixture)
+        .arg("build")
+        .output()
+        .expect("spawn build #2");
+    let build2_stderr = String::from_utf8_lossy(&build2.stderr);
+    assert!(build2.status.success(), "build #2 failed: {build2_stderr}");
+    assert!(
+        build2_stderr.contains("built 0"),
+        "build #2 should be fully cached after intervening check, got: {build2_stderr}"
+    );
+
+    // The kernel binary that build #1 wrote must still exist (and not
+    // have been clobbered by check, which only writes metadata).
+    let kernel_bin = fixture
+        .join("build")
+        .join("cross")
+        .join("x86_64-unknown-none")
+        .join("dev")
+        .join("final")
+        .join("kernel");
+    assert!(
+        kernel_bin.is_file(),
+        "kernel binary should still exist after check then build, expected at {kernel_bin:?}"
+    );
+}
+
+/// Cold `gluon clippy`. Skipped if either rustc OR clippy-driver is
+/// missing.
+#[test]
+#[ignore]
+fn gluon_clippy_cold() {
+    let Some(()) = require_rustc_or_skip("gluon_clippy_cold") else {
+        return;
+    };
+    // clippy-driver lookup mirrors `DriverKind::resolve_clippy_driver`:
+    // env var, then sibling-of-rustc, then $PATH. Spawning a probe is
+    // overkill — if the binary isn't present, the gluon clippy run
+    // will surface a useful error and we want the test to skip rather
+    // than fail in CI sandboxes that don't have clippy.
+    if !clippy_driver_available() {
+        eprintln!("gluon_clippy_cold: skipped — clippy-driver not found");
+        return;
+    }
+    let (_tmp, fixture) = setup_fixture();
+
+    let output = gluon_command(&fixture)
+        .arg("clippy")
+        .output()
+        .expect("spawn gluon clippy");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "gluon clippy failed: status={:?}, stderr=\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("linted "),
+        "clippy summary should contain 'linted N', got: {stderr}"
+    );
+    // Output should land under build/tool/clippy/, separate from build
+    // and check artifacts.
+    let clippy_root = fixture.join("build").join("tool").join("clippy");
+    assert!(
+        clippy_root.is_dir(),
+        "expected build/tool/clippy/ to exist after `gluon clippy`"
+    );
+}
+
+fn clippy_driver_available() -> bool {
+    if let Some(path) = std::env::var_os("CLIPPY_DRIVER") {
+        return Path::new(&path).is_file();
+    }
+    // Sibling of rustc — the rustup install layout puts both in the
+    // same toolchain bin dir.
+    if let Ok(info) = gluon_core::RustcInfo::probe() {
+        if let Some(parent) = info.rustc_path.parent() {
+            let cand = parent.join(if cfg!(windows) {
+                "clippy-driver.exe"
+            } else {
+                "clippy-driver"
+            });
+            if cand.is_file() {
+                return true;
+            }
+        }
+    }
+    // Final fallback: bare-name lookup via spawning `clippy-driver -V`.
+    Command::new("clippy-driver")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `gluon fmt --check` on the fixture passes when the sources are
+/// already formatted. The fixture's crates start out clean.
+#[test]
+fn gluon_fmt_check_passes_on_formatted_fixture() {
+    if !rustfmt_available() {
+        eprintln!("gluon_fmt_check_passes_on_formatted_fixture: skipped — rustfmt not found");
+        return;
+    }
+    let (_tmp, fixture) = setup_fixture();
+
+    let output = gluon_command(&fixture)
+        .arg("fmt")
+        .arg("--check")
+        .output()
+        .expect("spawn gluon fmt --check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "gluon fmt --check should pass on a clean fixture, got status={:?}, stderr=\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("processed"),
+        "fmt summary should report 'processed', got: {stderr}"
+    );
+}
+
+/// `gluon fmt --check` on a deliberately-unformatted source must
+/// exit non-zero and name the offending crate. Mutates a copy of the
+/// fixture so the on-disk source tree is unaffected.
+#[test]
+fn gluon_fmt_check_fails_on_unformatted_fixture() {
+    if !rustfmt_available() {
+        eprintln!("gluon_fmt_check_fails_on_unformatted_fixture: skipped — rustfmt not found");
+        return;
+    }
+    let (_tmp, fixture) = setup_fixture();
+
+    // Deliberately misformat one source file. The fixture's
+    // `kernel/src/main.rs` is the obvious target. Multiple statements
+    // on a line is something rustfmt always normalizes.
+    let main_path = fixture.join("crates/kernel/src/main.rs");
+    let contents = fs::read_to_string(&main_path).expect("read main.rs");
+    let bad = format!(
+        "// fmt-check fixture marker\n{}\nfn _trailing(){{let _x =1;let _y= 2;}}\n",
+        contents
+    );
+    fs::write(&main_path, bad).expect("write misformatted main.rs");
+
+    let output = gluon_command(&fixture)
+        .arg("fmt")
+        .arg("--check")
+        .output()
+        .expect("spawn gluon fmt --check");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "gluon fmt --check should fail on an unformatted fixture, but it succeeded; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unformatted") || stderr.contains("need formatting"),
+        "stderr should mention unformatted/need formatting, got: {stderr}"
+    );
+}
+
+fn rustfmt_available() -> bool {
+    if let Some(path) = std::env::var_os("RUSTFMT") {
+        return Path::new(&path).is_file();
+    }
+    Command::new("rustfmt")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}

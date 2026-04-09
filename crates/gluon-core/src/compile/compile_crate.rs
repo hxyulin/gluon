@@ -200,7 +200,16 @@ pub(crate) fn build_rustc_command(
     };
 
     // --- Builder assembly ---
-    let mut builder = RustcCommandBuilder::new(&ctx.rustc_info.rustc_path);
+    //
+    // The program path is selected by `ctx.driver`. For
+    // `DriverKind::Rustc` (the historical default) this is just the
+    // probed rustc path. For `Check` it is also rustc, but we will
+    // override the `--emit` kinds below to suppress codegen. For
+    // `Clippy` it resolves `clippy-driver` (env, sibling-of-rustc, or
+    // PATH lookup), which is rustc-CLI-compatible so every flag below
+    // applies unchanged.
+    let program = ctx.driver().program(&ctx.rustc_info);
+    let mut builder = RustcCommandBuilder::new(&program);
 
     // Input source file — positional arg, must come first.
     builder.input(&src_file);
@@ -271,9 +280,31 @@ pub(crate) fn build_rustc_command(
     // it to a location we control, rather than deriving it from --out-dir +
     // crate name + extra-filename. This keeps the "where does the .d land?"
     // knowledge in one place (the `depfile_path` bound above).
-    let emit_kinds: &[Emit] = match crate_def.crate_type {
+    //
+    // The driver may force a metadata-only emit (`Check` and `Clippy`
+    // both do this) — in that case it returns `Some(slice)` from
+    // `emit_override` and we use it instead of the per-crate-type
+    // selection. The depfile is still emitted so the cache freshness
+    // logic continues to track source dependencies; it is correct on a
+    // metadata-only build because rustc still produces accurate
+    // dep-info even when codegen is suppressed.
+    //
+    // **Proc-macros are exempt from the override.** A proc-macro crate
+    // must produce a real dylib because the dependent crate's compile
+    // pass dlopens it at compile time. Forcing `--emit=metadata` here
+    // would write only an `.rmeta` and the next crate's rustc would
+    // fail with "extern location for X does not exist". `cargo check`
+    // has exactly the same behavior — it always builds proc-macros
+    // fully, regardless of the check vs build distinction. We mirror
+    // that.
+    let default_emit: &[Emit] = match crate_def.crate_type {
         CrateType::Bin => &[Emit::Link, Emit::DepInfo],
         _ => &[Emit::Link, Emit::Metadata, Emit::DepInfo],
+    };
+    let emit_kinds: &[Emit] = if crate_def.crate_type == CrateType::ProcMacro {
+        default_emit
+    } else {
+        ctx.driver().emit_override().unwrap_or(default_emit)
     };
     builder.emit_with_dep_info_path(emit_kinds, &depfile_path);
 
@@ -362,7 +393,29 @@ pub(crate) fn build_rustc_command(
             .raw_arg(format!("extra-filename={extra_filename}"));
     }
 
-    Ok((builder, output_path, depfile_path))
+    // For Check/Clippy on non-proc-macro crates, the artifact path
+    // computed above (rlib / bin / dylib) is *never written* — only
+    // metadata + dep-info land on disk. The cache freshness check in
+    // `compile_and_cache` uses `output_path.exists()` as a final
+    // sanity guard, which would fail forever under those drivers and
+    // re-run rustc on every invocation.
+    //
+    // Use the depfile as the cache stamp instead: rustc reliably
+    // writes it under both Rustc and Check/Clippy, and its existence
+    // is a faithful proxy for "we ran a successful compile". The
+    // BuildRecord stores it the same way as a real artifact path; the
+    // `compile()` caller's return value is the path that downstream
+    // crates use to wire `--extern`, so for proc-macros (which still
+    // produce a real artifact under Check) we keep the original
+    // dylib path.
+    let cache_output_path =
+        if ctx.driver().emit_override().is_some() && crate_def.crate_type != CrateType::ProcMacro {
+            depfile_path.clone()
+        } else {
+            output_path.clone()
+        };
+
+    Ok((builder, cache_output_path, depfile_path))
 }
 
 /// Compile a single crate. Returns the absolute path of the produced
@@ -398,10 +451,24 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<(PathBu
     let argv_hash = builder.hash();
 
     // Derive the cache key. The key encodes enough context to avoid
-    // collisions between crates with the same name in different targets or
-    // profiles.
+    // collisions between crates with the same name in different
+    // targets, profiles, or drivers.
+    //
+    // The driver suffix matters because `gluon build` and `gluon check`
+    // share the same crate name, target, and profile but produce
+    // different rustc invocations (different `--out-dir`, different
+    // `--emit`, possibly different program). Without the suffix the
+    // two would race over a single `BuildRecord`: each invocation
+    // would invalidate the other's cache, and the second `build` after
+    // an interleaved `check` would re-spawn rustc unnecessarily.
+    // Including the driver in the key gives each tool its own slot.
+    let driver_suffix = match ctx.driver() {
+        crate::compile::DriverKind::Rustc => "",
+        crate::compile::DriverKind::Check => ":check",
+        crate::compile::DriverKind::Clippy => ":clippy",
+    };
     let cache_key = if crate_ref.host {
-        format!("crate:host:{crate_name}")
+        format!("crate:host:{crate_name}{driver_suffix}")
     } else {
         let target = model.targets.get(crate_ref.target).ok_or_else(|| {
             Error::Compile(format!(
@@ -410,8 +477,8 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<(PathBu
             ))
         })?;
         format!(
-            "crate:cross:{}:{}:{}",
-            crate_name, resolved.profile.name, target.name
+            "crate:cross:{}:{}:{}{}",
+            crate_name, resolved.profile.name, target.name, driver_suffix
         )
     };
 
@@ -590,7 +657,15 @@ mod tests {
 
     /// Build a minimal `CompileCtx` backed by a fresh temp-dir cache.
     fn make_ctx(tmp: &Path, rustc_path: impl Into<PathBuf>) -> CompileCtx {
-        let layout = BuildLayout::new(tmp.join("build"), "testproject");
+        make_ctx_with_driver(tmp, rustc_path, crate::compile::DriverKind::Rustc)
+    }
+
+    fn make_ctx_with_driver(
+        tmp: &Path,
+        rustc_path: impl Into<PathBuf>,
+        driver: crate::compile::DriverKind,
+    ) -> CompileCtx {
+        let layout = BuildLayout::with_driver(tmp.join("build"), "testproject", driver);
         let info = fake_rustc_info(rustc_path);
         // Create the build dir before loading the cache so a later
         // cache.save() can atomically write-rename into it. Cache::load
@@ -1367,6 +1442,236 @@ mod tests {
         assert!(
             !output_path.to_string_lossy().contains("-gluon-"),
             "output path should not contain -gluon- suffix, got: {output_path:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // T2: DriverKind threading through compile_crate
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn driver_check_swaps_emit_to_metadata_only_and_keeps_rustc_path() {
+        // DriverKind::Check should:
+        //   1. Use the same rustc binary as DriverKind::Rustc.
+        //   2. Force `--emit=metadata` regardless of crate type, even
+        //      for libs that would normally also emit link.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = make_ctx_with_driver(
+            tmp.path(),
+            "/usr/bin/rustc",
+            crate::compile::DriverKind::Check,
+        );
+
+        let mut model = BuildModel::default();
+        let th = insert_target(&mut model, make_target("host", "x86_64", true));
+        let ch = insert_crate(
+            &mut model,
+            CrateDef {
+                name: "lib1".into(),
+                path: "crates/lib1".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Lib,
+                ..Default::default()
+            },
+        );
+        let resolved = make_resolved(th, tmp.path().to_path_buf());
+        let crate_ref = host_ref(ch, th);
+        let artifacts = ArtifactMap::new();
+
+        let (builder, _, _) = build_rustc_command(
+            &ctx,
+            &CompileCrateInput {
+                model: &model,
+                resolved: &resolved,
+                crate_ref: &crate_ref,
+                artifacts: &artifacts,
+                sysroot_dir: None,
+            },
+        )
+        .unwrap();
+
+        // Program path is unchanged.
+        assert_eq!(builder.rustc_path(), Path::new("/usr/bin/rustc"));
+
+        // Emit kinds: must be metadata-only, no link, no dep-info.
+        // Find the `--emit=...` argument and check its value.
+        let args = args_as_strings(&builder);
+        let emit_arg = args
+            .iter()
+            .find(|a| a.starts_with("--emit="))
+            .expect("--emit flag missing");
+        assert!(
+            emit_arg.contains("metadata"),
+            "expected metadata in {emit_arg}"
+        );
+        assert!(
+            !emit_arg.contains("link"),
+            "DriverKind::Check should suppress link emit, got {emit_arg}"
+        );
+    }
+
+    #[test]
+    fn driver_clippy_swaps_program_path() {
+        // DriverKind::Clippy should resolve a clippy-driver path
+        // (sibling-of-rustc heuristic in this test setup, since the
+        // sentinel /usr/bin doesn't actually contain one), AND force
+        // metadata-only emit. The exact resolved path depends on the
+        // host environment; we assert the program is *not* the
+        // configured rustc path, which is enough to prove the swap
+        // happened.
+        let tmp = tempfile::tempdir().unwrap();
+        // Use a sentinel path that definitely has no clippy-driver
+        // sibling so the resolver falls through to bare-name PATH
+        // lookup. The sibling-of-rustc heuristic checks `is_file()` so
+        // a non-existent sibling won't accidentally match.
+        let ctx = make_ctx_with_driver(
+            tmp.path(),
+            "/nonexistent/path/rustc",
+            crate::compile::DriverKind::Clippy,
+        );
+
+        let mut model = BuildModel::default();
+        let th = insert_target(&mut model, make_target("host", "x86_64", true));
+        let ch = insert_crate(
+            &mut model,
+            CrateDef {
+                name: "lib1".into(),
+                path: "crates/lib1".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Lib,
+                ..Default::default()
+            },
+        );
+        let resolved = make_resolved(th, tmp.path().to_path_buf());
+        let crate_ref = host_ref(ch, th);
+        let artifacts = ArtifactMap::new();
+
+        let (builder, _, _) = build_rustc_command(
+            &ctx,
+            &CompileCrateInput {
+                model: &model,
+                resolved: &resolved,
+                crate_ref: &crate_ref,
+                artifacts: &artifacts,
+                sysroot_dir: None,
+            },
+        )
+        .unwrap();
+
+        // Program path should be clippy-driver (or .exe on Windows),
+        // not the configured rustc path.
+        let program = builder.rustc_path();
+        let name = program.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(
+            name.starts_with("clippy-driver"),
+            "expected clippy-driver, got {program:?}"
+        );
+        assert_ne!(program, Path::new("/nonexistent/path/rustc"));
+
+        // Emit kinds should be metadata-only.
+        let args = args_as_strings(&builder);
+        let emit_arg = args
+            .iter()
+            .find(|a| a.starts_with("--emit="))
+            .expect("--emit flag missing");
+        assert!(emit_arg.contains("metadata"));
+        assert!(!emit_arg.contains("link"));
+    }
+
+    #[test]
+    fn driver_check_does_not_override_emit_for_proc_macros() {
+        // Regression test: proc-macros must produce a dylib because the
+        // dependent crate dlopens them at compile time. Forcing
+        // metadata-only on a proc-macro would break the next crate's
+        // build with "extern location for X does not exist".
+        //
+        // This is the same exemption cargo check uses — it always
+        // builds proc-macros fully even when the rest of the workspace
+        // is metadata-only.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = make_ctx_with_driver(
+            tmp.path(),
+            "/usr/bin/rustc",
+            crate::compile::DriverKind::Check,
+        );
+
+        let mut model = BuildModel::default();
+        let th = insert_target(&mut model, make_target("host", "x86_64", true));
+        let ch = insert_crate(
+            &mut model,
+            CrateDef {
+                name: "macro1".into(),
+                path: "crates/macro1".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::ProcMacro,
+                ..Default::default()
+            },
+        );
+        let resolved = make_resolved(th, tmp.path().to_path_buf());
+        let crate_ref = host_ref(ch, th);
+        let artifacts = ArtifactMap::new();
+
+        let (builder, _, _) = build_rustc_command(
+            &ctx,
+            &CompileCrateInput {
+                model: &model,
+                resolved: &resolved,
+                crate_ref: &crate_ref,
+                artifacts: &artifacts,
+                sysroot_dir: None,
+            },
+        )
+        .unwrap();
+
+        let args = args_as_strings(&builder);
+        let emit_arg = args.iter().find(|a| a.starts_with("--emit=")).unwrap();
+        assert!(
+            emit_arg.contains("link"),
+            "proc-macro under DriverKind::Check must keep link emit, got {emit_arg}"
+        );
+    }
+
+    #[test]
+    fn driver_rustc_default_preserves_link_emit_for_libs() {
+        // Sanity check: the historical default path must still emit
+        // link for libraries. If this test fails, T2 has broken
+        // gluon build.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = make_ctx(tmp.path(), "/usr/bin/rustc");
+
+        let mut model = BuildModel::default();
+        let th = insert_target(&mut model, make_target("host", "x86_64", true));
+        let ch = insert_crate(
+            &mut model,
+            CrateDef {
+                name: "lib1".into(),
+                path: "crates/lib1".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Lib,
+                ..Default::default()
+            },
+        );
+        let resolved = make_resolved(th, tmp.path().to_path_buf());
+        let crate_ref = host_ref(ch, th);
+        let artifacts = ArtifactMap::new();
+
+        let (builder, _, _) = build_rustc_command(
+            &ctx,
+            &CompileCrateInput {
+                model: &model,
+                resolved: &resolved,
+                crate_ref: &crate_ref,
+                artifacts: &artifacts,
+                sysroot_dir: None,
+            },
+        )
+        .unwrap();
+
+        let args = args_as_strings(&builder);
+        let emit_arg = args.iter().find(|a| a.starts_with("--emit=")).unwrap();
+        assert!(
+            emit_arg.contains("link"),
+            "DriverKind::Rustc must keep link emit, got {emit_arg}"
         );
     }
 

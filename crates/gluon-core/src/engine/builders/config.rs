@@ -86,6 +86,8 @@ fn register_config_ctors(engine: &mut Engine, state: EngineState) {
                                 bindings: Vec::new(),
                                 visible_if: Vec::new(),
                                 span: Some(span.clone()),
+                                depends_on_expr: None,
+                                visible_if_expr: None,
                             },
                         );
                         false

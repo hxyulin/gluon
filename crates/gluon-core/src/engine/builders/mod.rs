@@ -7,6 +7,7 @@ use super::EngineState;
 use rhai::Engine;
 
 pub(super) mod config;
+pub(super) mod kconfig;
 pub(super) mod model;
 pub(super) mod pipeline;
 
@@ -91,5 +92,6 @@ pub(super) fn register_all(engine: &mut Engine, state: &EngineState) {
 
     model::register(engine, state);
     config::register(engine, state);
+    kconfig::register(engine, state);
     pipeline::register(engine, state);
 }

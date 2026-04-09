@@ -28,8 +28,10 @@ fn run() -> Result<()> {
         return cmd::external::run(args);
     }
 
-    // `clean` takes the lighter layout-only context (no rustc probe)
-    // so it still works when the toolchain is broken or missing.
+    // `clean` and `fmt` take the lighter layout-only context (no
+    // rustc probe) so they still work when the toolchain is broken
+    // or missing. `fmt` only needs `rustfmt`, which it resolves
+    // separately via $RUSTFMT or $PATH.
     if let cli::Command::Clean(args) = &cli.command {
         let ctx = cmd::build_layout_context(
             cli.profile.as_deref(),
@@ -37,6 +39,43 @@ fn run() -> Result<()> {
             cli.config_file.as_deref(),
         )?;
         return cmd::clean::run(ctx, args.keep_sysroot);
+    }
+    if let cli::Command::Fmt(args) = &cli.command {
+        let ctx = cmd::build_layout_context(
+            cli.profile.as_deref(),
+            cli.target.as_deref(),
+            cli.config_file.as_deref(),
+        )?;
+        return cmd::fmt::run(ctx, args.check);
+    }
+
+    // `check` builds a context whose layout is flavored for the check
+    // driver — that's what routes user-crate output under
+    // `build/tool/check/` so it can't clobber `gluon build` artifacts.
+    // Same rustc probe path otherwise; check still needs the host
+    // toolchain to invoke `--emit=metadata`.
+    // `check` and `clippy` build a context whose layout is flavored
+    // for the relevant driver — that's what routes user-crate output
+    // under `build/tool/<driver>/` so it can't clobber `gluon build`
+    // artifacts. Same rustc probe path otherwise; both still need the
+    // host toolchain.
+    if matches!(&cli.command, cli::Command::Check(_)) {
+        let ctx = cmd::build_context_for_driver(
+            cli.profile.as_deref(),
+            cli.target.as_deref(),
+            cli.config_file.as_deref(),
+            gluon_core::DriverKind::Check,
+        )?;
+        return cmd::check::run(ctx, cli.jobs);
+    }
+    if matches!(&cli.command, cli::Command::Clippy(_)) {
+        let ctx = cmd::build_context_for_driver(
+            cli.profile.as_deref(),
+            cli.target.as_deref(),
+            cli.config_file.as_deref(),
+            gluon_core::DriverKind::Clippy,
+        )?;
+        return cmd::clippy::run(ctx, cli.jobs);
     }
 
     let ctx = cmd::build_context(
@@ -48,7 +87,11 @@ fn run() -> Result<()> {
     match cli.command {
         cli::Command::Build(_) => cmd::build::run(ctx, cli.jobs),
         cli::Command::Configure(args) => cmd::configure::run(ctx, args.output),
-        cli::Command::Clean(_) | cli::Command::External(_) => {
+        cli::Command::Check(_)
+        | cli::Command::Clippy(_)
+        | cli::Command::Clean(_)
+        | cli::Command::Fmt(_)
+        | cli::Command::External(_) => {
             unreachable!("handled above")
         }
     }

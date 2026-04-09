@@ -71,6 +71,19 @@ pub struct Cli {
 pub enum Command {
     /// Build the project.
     Build(BuildArgs),
+    /// Run a metadata-only check pass over every crate in the build
+    /// model. Equivalent to `cargo check` but uses gluon's per-crate
+    /// flag assembly so the same `--cfg`s, target, sysroot, and
+    /// extern deps that `gluon build` would use are applied here too.
+    Check(CheckArgs),
+    /// Run clippy over every crate in the build model. Same per-crate
+    /// flag assembly as `gluon build`, but the program path swaps
+    /// `rustc` for `clippy-driver` (resolved via `$CLIPPY_DRIVER`,
+    /// then a sibling-of-rustc heuristic, then `$PATH`).
+    Clippy(ClippyArgs),
+    /// Run `rustfmt` over every crate. Pass `--check` to verify
+    /// formatting without rewriting (matches `cargo fmt --check`).
+    Fmt(FmtArgs),
     /// Remove the build directory.
     Clean(CleanArgs),
     /// Generate `rust-project.json` for rust-analyzer.
@@ -87,6 +100,25 @@ pub enum Command {
 /// Arguments for `gluon build`.
 #[derive(clap::Args, Debug)]
 pub struct BuildArgs {}
+
+/// Arguments for `gluon check`. Currently empty — the same global
+/// `-p`/`-t`/`-j`/`-C` flags that apply to `build` apply here.
+#[derive(clap::Args, Debug)]
+pub struct CheckArgs {}
+
+/// Arguments for `gluon clippy`. Currently empty.
+#[derive(clap::Args, Debug)]
+pub struct ClippyArgs {}
+
+/// Arguments for `gluon fmt`.
+#[derive(clap::Args, Debug)]
+pub struct FmtArgs {
+    /// Verify formatting without rewriting files (mirrors
+    /// `cargo fmt --check`). Exit code is non-zero if any crate has
+    /// unformatted files.
+    #[arg(long)]
+    pub check: bool,
+}
 
 /// Arguments for `gluon clean`.
 #[derive(clap::Args, Debug)]
@@ -114,6 +146,44 @@ mod tests {
         let cli = Cli::try_parse_from(["gluon", "build"]).expect("parse");
         assert!(matches!(cli.command, Command::Build(_)));
         assert_eq!(cli.profile, None);
+    }
+
+    #[test]
+    fn parses_bare_check() {
+        let cli = Cli::try_parse_from(["gluon", "check"]).expect("parse");
+        assert!(matches!(cli.command, Command::Check(_)));
+    }
+
+    #[test]
+    fn parses_check_with_profile_and_jobs() {
+        let cli = Cli::try_parse_from(["gluon", "-p", "dev", "-j", "2", "check"]).expect("parse");
+        assert_eq!(cli.profile.as_deref(), Some("dev"));
+        assert_eq!(cli.jobs, Some(2));
+        assert!(matches!(cli.command, Command::Check(_)));
+    }
+
+    #[test]
+    fn parses_bare_clippy() {
+        let cli = Cli::try_parse_from(["gluon", "clippy"]).expect("parse");
+        assert!(matches!(cli.command, Command::Clippy(_)));
+    }
+
+    #[test]
+    fn parses_fmt_default() {
+        let cli = Cli::try_parse_from(["gluon", "fmt"]).expect("parse");
+        match cli.command {
+            Command::Fmt(a) => assert!(!a.check),
+            other => panic!("expected Fmt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_fmt_check() {
+        let cli = Cli::try_parse_from(["gluon", "fmt", "--check"]).expect("parse");
+        match cli.command {
+            Command::Fmt(a) => assert!(a.check),
+            other => panic!("expected Fmt, got {other:?}"),
+        }
     }
 
     #[test]

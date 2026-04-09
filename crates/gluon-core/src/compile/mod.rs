@@ -16,10 +16,13 @@
 
 pub mod compile_and_cache;
 pub mod compile_crate;
+pub mod driver;
 pub mod extern_map;
 pub mod layout;
 pub mod rustc;
 pub mod rustc_info;
+
+pub use driver::DriverKind;
 
 pub(crate) use compile_and_cache::compile_and_cache as run_compile_and_cache;
 
@@ -58,11 +61,25 @@ pub struct CompileCtx {
 }
 
 impl CompileCtx {
+    /// Construct a context. The active [`DriverKind`] is carried by
+    /// `layout` (constructed via [`BuildLayout::new`] for the default
+    /// `gluon build` flow, or [`BuildLayout::with_driver`] for
+    /// `gluon check` / `gluon clippy`). Keeping the driver on the
+    /// layout means every path-arithmetic call automatically routes
+    /// user-crate output into the correct per-driver subtree without
+    /// any caller having to thread the driver explicitly.
     pub fn new(layout: BuildLayout, rustc_info: Arc<RustcInfo>, cache: Cache) -> Self {
         Self {
             layout,
             rustc_info,
             cache: Mutex::new(cache),
         }
+    }
+
+    /// Convenience: returns the driver this context's layout is
+    /// configured for. Used by `compile_crate` to pick the program
+    /// binary and emit overrides.
+    pub fn driver(&self) -> DriverKind {
+        self.layout.driver()
     }
 }

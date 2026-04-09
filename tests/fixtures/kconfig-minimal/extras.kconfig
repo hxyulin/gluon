@@ -1,0 +1,12 @@
+# Sourced from `options.kconfig` to exercise file inclusion.
+#
+# `FANCY_FEATURE` uses a true boolean expression — `LOG_ENABLED && !DEBUG`
+# — that the legacy flat `Vec<String>` form cannot represent. The K9
+# parity test does not check this option (the Rhai equivalent omits it
+# because there's no way to write the expression there); the dedicated
+# expression-semantics test in the integration suite does.
+
+config FANCY_FEATURE: bool {
+    default = true
+    depends_on = LOG_ENABLED && !DEBUG
+}
