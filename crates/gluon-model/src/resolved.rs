@@ -33,8 +33,15 @@ pub struct ResolvedProfile {
 pub struct ResolvedCrateRef {
     pub handle: Handle<CrateDef>,
     /// Always equals the crate's own `target_handle` after resolution; carried
-    /// here so the scheduler can avoid the indirection.
+    /// here so the scheduler can avoid the indirection. For host crates this
+    /// is a placeholder (the resolved target of the active profile) and the
+    /// `host` flag should be consulted instead.
     pub target: Handle<TargetDef>,
+    /// True when this crate's group targets the literal `"host"` triple.
+    /// Host crates are built for the build machine and are not subject to
+    /// the profile's target.
+    #[serde(default)]
+    pub host: bool,
 }
 
 /// A fully-resolved build configuration, consumed by scheduler/compile.
