@@ -1,0 +1,215 @@
+//! Built-in rule handlers shipped with gluon-core.
+//!
+//! MVP-M ships only `exec`. Future chunks may add image generation, linker
+//! orchestration, etc. Each builtin is a zero-size struct implementing
+//! [`RuleFn`].
+
+use super::{RuleCtx, RuleFn};
+use crate::error::{Diagnostic, Error, Result};
+use gluon_model::RuleDef;
+use std::path::PathBuf;
+use std::process::Command;
+
+/// Built-in `exec` rule handler.
+///
+/// Runs an arbitrary command with the substituted input args as argv.
+///
+/// ### Argument contract
+///
+/// - `inputs[0]` is the command path (or name looked up via `PATH`).
+/// - `inputs[1..]` are its arguments.
+/// - `outputs` is ignored by the handler itself; the scheduler uses it for
+///   cache-invalidation bookkeeping.
+///
+/// ### Working directory
+///
+/// The command is run with `ctx.layout.root()` as the current directory so
+/// that relative paths in substituted args resolve against the build root
+/// rather than whatever directory the gluon process happens to be running in.
+/// This makes rules portable: a rule that references `./sentinel` always means
+/// `<build_dir>/sentinel` regardless of how the user invoked `gluon`.
+///
+/// ### Stdout
+///
+/// Stdout from successful rule executions is discarded in MVP-M (no output
+/// buffering integration yet). Chunk B3's scheduler worker will later provide
+/// output buffers; for now rules are silent on success. Users who need to
+/// capture output can redirect within the command itself (e.g. `sh -c 'cmd >
+/// outfile'`).
+pub struct ExecRule;
+
+impl RuleFn for ExecRule {
+    fn execute(
+        &self,
+        ctx: &RuleCtx<'_>,
+        rule: &RuleDef,
+        inputs: &[String],
+        _outputs: &[String],
+    ) -> Result<()> {
+        // Guard: exec requires at least one input (the command).
+        if inputs.is_empty() {
+            return Err(Error::Compile(format!(
+                "rule '{}': exec requires at least one input arg (the command)",
+                rule.name
+            )));
+        }
+
+        // `split_first` is safe here because we checked `is_empty` above.
+        let (cmd, args) = inputs.split_first().unwrap();
+
+        let output = Command::new(cmd)
+            .args(args)
+            // Run from the build root — see struct-level doc comment.
+            .current_dir(ctx.layout.root())
+            .output()
+            .map_err(|e| Error::Io {
+                path: PathBuf::from(cmd),
+                source: e,
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Diagnostics(vec![
+                Diagnostic::error(format!(
+                    "rule '{}': exec command '{}' failed: exit={:?}",
+                    rule.name,
+                    cmd,
+                    output.status.code()
+                ))
+                .with_note(format!("stderr:\n{}", stderr))
+                .with_note(format!("command: {} {:?}", cmd, args)),
+            ]));
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use crate::error::Error;
+    use crate::rule::tests::test_support::make_ctx_parts;
+    use crate::rule::{RuleCtx, RuleRegistry};
+    use gluon_model::{RuleDef, RuleHandler};
+
+    fn make_exec_rule(name: &str, inputs: Vec<String>) -> RuleDef {
+        RuleDef {
+            name: name.into(),
+            inputs,
+            outputs: vec![],
+            depends_on: vec![],
+            handler: RuleHandler::Builtin("exec".into()),
+            span: None,
+        }
+    }
+
+    #[test]
+    fn exec_empty_inputs_returns_compile_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let ctx = RuleCtx {
+            layout: &layout,
+            resolved: &resolved,
+            model: &model,
+        };
+        let registry = RuleRegistry::with_builtins();
+        let rule = make_exec_rule("myrule", vec![]);
+
+        let err = registry.dispatch(&ctx, &rule).unwrap_err();
+        match err {
+            Error::Compile(msg) => {
+                assert!(msg.contains("exec"), "should mention exec: {msg}");
+                assert!(msg.contains("myrule"), "should name rule: {msg}");
+            }
+            other => panic!("expected Error::Compile, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_runs_command_and_produces_output_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let ctx = RuleCtx {
+            layout: &layout,
+            resolved: &resolved,
+            model: &model,
+        };
+        let registry = RuleRegistry::with_builtins();
+
+        // Use `sh -c 'touch "$1"' -- <path>` to create a sentinel file.
+        // `${build_dir}/sentinel` will be substituted to the real build dir.
+        let sentinel_path = format!("{}/sentinel", tmp.path().join("build").display());
+        let rule = RuleDef {
+            name: "touchrule".into(),
+            inputs: vec![
+                "sh".into(),
+                "-c".into(),
+                "touch \"$1\"".into(),
+                "--".into(),
+                "${build_dir}/sentinel".into(),
+            ],
+            outputs: vec![],
+            depends_on: vec![],
+            handler: RuleHandler::Builtin("exec".into()),
+            span: None,
+        };
+
+        registry.dispatch(&ctx, &rule).unwrap();
+
+        assert!(
+            std::path::Path::new(&sentinel_path).exists(),
+            "sentinel file should have been created at {sentinel_path}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_nonzero_exit_returns_diagnostic_with_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, model, resolved) = make_ctx_parts(tmp.path());
+        let ctx = RuleCtx {
+            layout: &layout,
+            resolved: &resolved,
+            model: &model,
+        };
+        let registry = RuleRegistry::with_builtins();
+
+        let rule = RuleDef {
+            name: "failrule".into(),
+            inputs: vec!["sh".into(), "-c".into(), "echo boom >&2; exit 1".into()],
+            outputs: vec![],
+            depends_on: vec![],
+            handler: RuleHandler::Builtin("exec".into()),
+            span: None,
+        };
+
+        let err = registry.dispatch(&ctx, &rule).unwrap_err();
+        match err {
+            Error::Diagnostics(diags) => {
+                assert!(!diags.is_empty(), "should have at least one diagnostic");
+                let diag = &diags[0];
+                assert!(
+                    diag.message.contains("failrule"),
+                    "headline should name rule: {}",
+                    diag.message
+                );
+                assert!(
+                    diag.message.contains("exit="),
+                    "headline should mention exit code: {}",
+                    diag.message
+                );
+                let notes_combined = diag.notes.join("\n");
+                assert!(
+                    notes_combined.contains("boom"),
+                    "notes should include stderr output: {notes_combined}"
+                );
+            }
+            other => panic!("expected Error::Diagnostics, got {other:?}"),
+        }
+    }
+}
