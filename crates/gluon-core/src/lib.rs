@@ -11,6 +11,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod rule;
+pub mod scheduler;
 pub mod sysroot;
 
 pub use cache::{BuildRecord, Cache, CacheManifest, FreshnessQuery};
@@ -23,6 +24,7 @@ pub use engine::evaluate_script;
 pub use error::{Diagnostic, Error, Level, Result};
 pub use rule::builtin::ExecRule;
 pub use rule::{RuleCtx, RuleFn, RuleRegistry};
+pub use scheduler::{Dag, DagNode, JobDispatcher, NodeId, WorkerPool, build_dag};
 pub use sysroot::ensure_sysroot;
 
 // Re-export the model crate for convenience — embedders can use either
