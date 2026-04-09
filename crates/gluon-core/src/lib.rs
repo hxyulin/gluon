@@ -10,12 +10,14 @@ pub mod compile;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod sysroot;
 
 pub use cache::{BuildRecord, Cache, CacheManifest, FreshnessQuery};
-pub use compile::{BuildLayout, Emit, RustcCommandBuilder, RustcInfo};
+pub use compile::{BuildLayout, CompileCtx, Emit, RustcCommandBuilder, RustcInfo};
 pub use config::resolve;
 pub use engine::evaluate_script;
 pub use error::{Diagnostic, Error, Level, Result};
+pub use sysroot::ensure_sysroot;
 
 // Re-export the model crate for convenience — embedders can use either
 // `gluon_core::model::BuildModel` or `gluon_model::BuildModel`.
