@@ -90,6 +90,35 @@ pub fn evaluate_script(path: impl AsRef<Path>) -> Result<BuildModel> {
     Ok(model)
 }
 
+/// Enumerate every Rhai function registered on a fresh Gluon engine
+/// (`target`, `group`, `config_option`, crate-builder methods, pipeline
+/// builders, …) as formatted signature strings.
+///
+/// Each entry is produced by Rhai's own `gen_fn_signatures` machinery
+/// and takes the shape `name(params) -> ReturnType`. Methods registered
+/// via `register_fn` without explicit parameter names collapse to
+/// positional placeholders (`_, _`).
+///
+/// This exists so editor tooling — the `gluon-lsp` binary and the
+/// tree-sitter query regenerator — can stay in sync with the engine
+/// automatically instead of duplicating the function list. Output is
+/// sorted for determinism (stable diffs when the DSL surface changes).
+///
+/// Pure introspection: a throwaway engine is built and no script is
+/// evaluated, so calling this has no filesystem side effects.
+pub fn dsl_signatures() -> Vec<String> {
+    // The script-file path on EngineState is only consulted by
+    // diagnostics, and no script is ever evaluated here — use a
+    // sentinel path so any accidental use (in a future refactor) is
+    // obviously wrong.
+    let state = EngineState::new(PathBuf::from("<dsl-introspection>"));
+    let mut engine = Engine::new();
+    builders::register_all(&mut engine, &state);
+    let mut sigs = engine.gen_fn_signatures(false);
+    sigs.sort();
+    sigs
+}
+
 /// Parse and evaluate a `gluon.rhai` file, returning the resulting
 /// [`BuildModel`] together with **all** accumulated diagnostics, regardless
 /// of whether any diagnostics were pushed.
@@ -150,6 +179,40 @@ mod tests {
         f.write_all(contents.as_bytes()).expect("write script");
         f.flush().expect("flush script");
         f
+    }
+
+    #[test]
+    fn dsl_signatures_include_known_entry_points() {
+        // Sanity check: the introspection helper must surface at least
+        // the well-known top-level entry points users call in every
+        // gluon.rhai. If any of these stop appearing, editor tooling
+        // relying on dsl_signatures() will silently degrade — fail
+        // loudly here instead.
+        let sigs = dsl_signatures();
+        let has = |name: &str| {
+            sigs.iter()
+                .any(|s| s.starts_with(&format!("{name}(")))
+        };
+        for name in [
+            "project",
+            "target",
+            "profile",
+            "group",
+            "pipeline",
+            "qemu",
+            "bootloader",
+            "image",
+            "dependency",
+        ] {
+            assert!(
+                has(name),
+                "expected `{name}(...)` in dsl_signatures output; got: {sigs:#?}"
+            );
+        }
+        // Determinism: output must be sorted.
+        let mut sorted = sigs.clone();
+        sorted.sort();
+        assert_eq!(sigs, sorted, "dsl_signatures must return sorted output");
     }
 
     #[test]

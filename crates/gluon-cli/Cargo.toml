@@ -29,6 +29,10 @@ path = "src/bin/fake_qemu.rs"
 gluon-core.workspace = true
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# Used only by `gluon internal dump-dsl` to emit a stable JSON wrapper
+# around the DSL signature list. Already in the workspace dep tree via
+# `gluon-core`, so this is a zero-cost addition.
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -28,6 +28,17 @@ fn run() -> Result<()> {
         return cmd::external::run(args);
     }
 
+    // `internal` subcommands are introspection/maintenance tools. None
+    // of them read a `gluon.rhai` off disk — dumping the DSL function
+    // list, for instance, only needs the in-memory engine registration
+    // — so they must short-circuit ahead of the context builders. That
+    // also means they can run from any directory.
+    if let cli::Command::Internal(sub) = &cli.command {
+        return match sub {
+            cli::InternalCommand::DumpDsl => cmd::internal::run_dump_dsl(),
+        };
+    }
+
     // `clean` and `fmt` take the lighter layout-only context (no
     // rustc probe) so they still work when the toolchain is broken
     // or missing. `fmt` only needs `rustfmt`, which it resolves
@@ -110,6 +121,7 @@ fn run() -> Result<()> {
         | cli::Command::Clean(_)
         | cli::Command::Fmt(_)
         | cli::Command::Vendor(_)
+        | cli::Command::Internal(_)
         | cli::Command::External(_) => {
             unreachable!("handled above")
         }

@@ -103,6 +103,16 @@ pub enum Command {
     /// `qemu().boot_mode(...)` → direct. Extra arguments after `--`
     /// are passed through to QEMU verbatim.
     Run(RunArgs),
+    /// Internal tools for gluon maintainers and editor integrations.
+    ///
+    /// Hidden from `--help` because these commands have no stability
+    /// guarantee — their output format may change across releases. The
+    /// subcommands here exist solely so in-tree tooling (the
+    /// `tree-sitter-gluon` query regen script, the `gluon-lsp` smoke
+    /// tests) has a canonical way to query the engine without
+    /// duplicating registration logic.
+    #[command(subcommand, hide = true)]
+    Internal(InternalCommand),
     /// Dispatch to an external `gluon-<name>` binary on `$PATH`.
     ///
     /// Clap's `external_subcommand` captures everything after the
@@ -110,6 +120,22 @@ pub enum Command {
     /// vector is the subcommand name itself (not stripped by clap).
     #[command(external_subcommand)]
     External(Vec<OsString>),
+}
+
+/// Hidden `gluon internal …` subcommands. Each variant is its own
+/// no-stability-promise maintenance tool; do not expose any of them
+/// in user-facing documentation.
+#[derive(Subcommand, Debug)]
+pub enum InternalCommand {
+    /// Dump the Rhai DSL function list registered on a fresh Gluon
+    /// engine as JSON on stdout.
+    ///
+    /// The output is the single source of truth for editor tooling
+    /// (`tree-sitter-gluon/queries/highlights.scm`, `gluon-lsp`
+    /// completion index) — a deterministic, sorted array of signature
+    /// strings produced by `rhai::Engine::gen_fn_signatures`. See
+    /// `gluon_core::engine::dsl_signatures` for the shape.
+    DumpDsl,
 }
 
 /// Arguments for `gluon build`.
@@ -344,6 +370,18 @@ mod tests {
         match cli.command {
             Command::Vendor(a) => assert!(a.offline),
             other => panic!("expected Vendor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_internal_dump_dsl() {
+        // The `internal` group is hidden from --help but still
+        // parseable. Guard against a future refactor silently breaking
+        // the regen script / LSP that depend on this exact path.
+        let cli = Cli::try_parse_from(["gluon", "internal", "dump-dsl"]).expect("parse");
+        match cli.command {
+            Command::Internal(InternalCommand::DumpDsl) => {}
+            other => panic!("expected Internal(DumpDsl), got {other:?}"),
         }
     }
 

@@ -15,7 +15,13 @@ workspace = true
 [dependencies]
 gluon-model.workspace = true
 fs2 = "0.4"
-rhai = "1.24"
+# `metadata` is enabled so `engine::dsl_signatures()` can enumerate the
+# registered DSL surface for editor tooling (LSP + tree-sitter query
+# regeneration). The feature adds per-function signature strings to the
+# registry; the cost is a few KB of binary + a `Vec<String>` at call
+# time. Worth it: without this we'd have to hand-maintain the function
+# list in two separate places and it would drift.
+rhai = { version = "1.24", features = ["metadata"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

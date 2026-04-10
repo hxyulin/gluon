@@ -1,0 +1,36 @@
+[package]
+name = "gluon-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Language server for Gluon's Rhai DSL (gluon.rhai). Provides completion and hover for runtime-registered builder functions."
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "gluon-lsp"
+path = "src/main.rs"
+
+[dependencies]
+# Reused so the LSP sees exactly the same registered function surface
+# the real build pipeline does — no drift possible, no hand-maintained
+# symbol lists. `dsl_signatures()` is the public helper.
+gluon-core.workspace = true
+
+# Minimal LSP transport. Same crate rust-analyzer uses; we deliberately
+# avoid `tower-lsp` because its async runtime requirement is overkill
+# for this workload (one in-memory index, no I/O beyond stdio).
+lsp-server = "0.7"
+lsp-types = "0.95"
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
