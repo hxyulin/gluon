@@ -355,6 +355,21 @@ fn gluon_configure_emits_valid_json() {
         body.contains("minimal_config"),
         "rust-project.json must reference the generated minimal_config crate: {body}"
     );
+    // `sysroot_src` must point to the `library/` subdirectory (where
+    // core/alloc/std live), not the parent `src/rust` directory. Missing
+    // this suffix silently breaks stdlib completions in rust-analyzer.
+    assert!(
+        body.contains("/library\""),
+        "sysroot_src must end in /library: {body}"
+    );
+    // Cross crates must carry a `target` field so rust-analyzer evaluates
+    // `#[cfg(target_os = \"none\")]` against the kernel's triple. Host
+    // crates legitimately omit it, but the fixture has a cross kernel, so
+    // at least one `target` key must appear somewhere in the output.
+    assert!(
+        body.contains("\"target\""),
+        "at least one crate must declare a target field: {body}"
+    );
 }
 
 /// `gluon clean` (default: no `--keep-sysroot`) must remove the entire

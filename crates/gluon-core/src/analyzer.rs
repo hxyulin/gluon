@@ -19,8 +19,9 @@
 //! See <https://rust-analyzer.github.io/manual.html#non-cargo-based-projects>.
 //! The fields populated here are the minimum subset rust-analyzer needs
 //! to index a non-cargo project: `sysroot_src` (optional) and `crates`
-//! (each with `root_module`, `edition`, `deps`, `cfg`, `env`,
-//! `is_workspace_member`, `is_proc_macro`, `source`).
+//! (each with `root_module`, `edition`, `deps`, `cfg`, `target`
+//! (cross crates only), `env`, `is_workspace_member`, `is_proc_macro`,
+//! `source`).
 
 use crate::compile::{BuildLayout, RustcInfo};
 use gluon_model::{BuildModel, CrateDef, CrateType, Handle, ResolvedConfig};
@@ -152,26 +153,35 @@ pub fn generate_rust_project_json(
 
         // --- cfg ---
         //
-        // Start with the crate's own explicit `cfg_flags`, then merge
-        // target-specific cfgs (target_arch, target_os, etc.) derived
-        // from `rustc --print=cfg --target=<triple>`. For host crates
-        // we skip the probe — they compile for the build machine and
-        // rust-analyzer already knows its cfgs. If the probe fails
-        // (custom target JSON not on the search path) we gracefully
-        // degrade to user-provided cfgs only.
-        let mut cfg: Vec<String> = krate.cfg_flags.clone();
-        if !cref.host {
-            if let Some(target_def) = model.targets.get(cref.target) {
-                let target_cfgs = rustc_info.target_cfgs(&target_def.name);
-                for tc in target_cfgs {
-                    if !cfg.contains(&tc) {
-                        cfg.push(tc);
-                    }
-                }
-            }
-        }
+        // Emit only the crate's explicit `cfg_flags`. Target-derived cfgs
+        // (target_arch, target_os, target_feature, …) are intentionally
+        // NOT merged here: we set the per-crate `target` field below, and
+        // rust-analyzer then runs `rustc --print=cfg --target=<triple>`
+        // itself to populate those. Duplicating them here would risk
+        // diverging from rust-analyzer's own derivation on toolchain
+        // updates and makes the JSON noisier for no benefit.
+        let cfg: Vec<String> = krate.cfg_flags.clone();
 
-        let entry = json!({
+        // --- target ---
+        //
+        // For cross crates we emit the triple (or custom-target JSON path)
+        // so rust-analyzer evaluates `#[cfg(target_os = "none")]` and the
+        // rest against the kernel's real target rather than the host. Host
+        // crates omit the field; rust-analyzer then falls back to the host
+        // triple, which is correct for them.
+        //
+        // `spec` is used rather than `name` because it is what rustc
+        // accepts as `--target`: for builtin triples the two are equal,
+        // but for custom targets `spec` is the JSON path and `name` is a
+        // human label. The compile pipeline uses `spec` for the same
+        // reason (see compile/command_builder.rs).
+        let target_spec: Option<String> = if cref.host {
+            None
+        } else {
+            model.targets.get(cref.target).map(|t| t.spec.clone())
+        };
+
+        let mut entry = json!({
             "root_module": root_module.to_string_lossy(),
             "edition": edition,
             "deps": deps,
@@ -184,14 +194,30 @@ pub fn generate_rust_project_json(
                 "exclude_dirs": [layout.root().to_string_lossy()],
             },
         });
+        if let Some(spec) = target_spec {
+            entry
+                .as_object_mut()
+                .expect("json! macro produces an object")
+                .insert("target".to_string(), Value::String(spec));
+        }
         crates_array.push(entry);
     }
 
     let mut top = serde_json::Map::new();
     if let Some(rust_src) = &rustc_info.rust_src {
+        // rust-analyzer expects the `library/` subdirectory that actually
+        // contains `core`, `alloc`, `std`. `RustcInfo::rust_src` stores the
+        // parent (`<sysroot>/lib/rustlib/src/rust`) because the sysroot
+        // builder walks into `library/<crate>/` per crate and needs the
+        // parent path. We append `library` only here, on emission.
         top.insert(
             "sysroot_src".to_string(),
-            Value::String(rust_src.to_string_lossy().into_owned()),
+            Value::String(
+                rust_src
+                    .join("library")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         );
     }
     top.insert("crates".to_string(), Value::Array(crates_array));
@@ -445,12 +471,117 @@ mod tests {
     }
 
     #[test]
-    fn rust_src_present_emits_sysroot_src_key() {
+    fn rust_src_present_emits_sysroot_src_with_library_suffix() {
+        // rust-analyzer expects the `library/` subdir that holds core,
+        // alloc, std — not the parent `src/rust` directory. Without this
+        // suffix, stdlib completions come up shallow or empty.
         let (model, _th) = make_fixture();
         let resolved = make_resolved(_th, Vec::new());
         let info = Arc::new(fake_rustc_info(Some(PathBuf::from("/path/to/rust-src"))));
         let json = generate_rust_project_json(&model, &resolved, &layout(), &info);
-        assert_eq!(json["sysroot_src"], "/path/to/rust-src");
+        assert_eq!(json["sysroot_src"], "/path/to/rust-src/library");
+    }
+
+    #[test]
+    fn cross_crate_emits_target_field() {
+        // Cross crates must carry a `target` field so rust-analyzer
+        // evaluates cfg gates against the kernel's triple rather than
+        // the host. Without this, `#[cfg(target_os = "none")]` blocks
+        // are treated as inactive and get no completions.
+        let (mut model, th) = make_fixture();
+        let (ch, _) = model.crates.insert(
+            "kernel".into(),
+            CrateDef {
+                name: "kernel".into(),
+                path: "crates/kernel".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Bin,
+                ..Default::default()
+            },
+        );
+        let resolved = make_resolved(
+            th,
+            vec![ResolvedCrateRef {
+                handle: ch,
+                target: th,
+                host: false,
+            }],
+        );
+        let info = Arc::new(fake_rustc_info(None));
+        let json = generate_rust_project_json(&model, &resolved, &layout(), &info);
+        // `spec` of the fixture target is the triple itself.
+        assert_eq!(
+            json["crates"][1]["target"], "x86_64-unknown-none",
+            "cross crates must carry target field, got: {}",
+            json["crates"][1]
+        );
+    }
+
+    #[test]
+    fn host_crate_omits_target_field() {
+        // Host crates compile for the build machine; rust-analyzer's
+        // default (host triple) is already correct. Emit absence, not
+        // null — the latter is a hard error in some rust-analyzer
+        // versions (see module docs).
+        let (mut model, th) = make_fixture();
+        let (ch, _) = model.crates.insert(
+            "host-tool".into(),
+            CrateDef {
+                name: "host-tool".into(),
+                path: "crates/host-tool".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Lib,
+                ..Default::default()
+            },
+        );
+        let resolved = make_resolved(
+            th,
+            vec![ResolvedCrateRef {
+                handle: ch,
+                target: th,
+                host: true,
+            }],
+        );
+        let info = Arc::new(fake_rustc_info(None));
+        let json = generate_rust_project_json(&model, &resolved, &layout(), &info);
+        assert!(
+            json["crates"][1].get("target").is_none(),
+            "host crates must omit target key entirely, got: {}",
+            json["crates"][1]
+        );
+    }
+
+    #[test]
+    fn cross_crate_cfg_only_reflects_explicit_cfg_flags() {
+        // Target-derived cfgs (target_os=…, target_arch=…) must NOT be
+        // merged into the cfg array — rust-analyzer derives them itself
+        // from the `target` field. Only the crate's own `cfg_flags`
+        // should appear.
+        let (mut model, th) = make_fixture();
+        let (ch, _) = model.crates.insert(
+            "kernel".into(),
+            CrateDef {
+                name: "kernel".into(),
+                path: "crates/kernel".into(),
+                edition: "2021".into(),
+                crate_type: CrateType::Bin,
+                cfg_flags: vec!["feature=\"smp\"".into()],
+                ..Default::default()
+            },
+        );
+        let resolved = make_resolved(
+            th,
+            vec![ResolvedCrateRef {
+                handle: ch,
+                target: th,
+                host: false,
+            }],
+        );
+        let info = Arc::new(fake_rustc_info(None));
+        let json = generate_rust_project_json(&model, &resolved, &layout(), &info);
+        let cfg = json["crates"][1]["cfg"].as_array().unwrap();
+        assert_eq!(cfg.len(), 1, "expected only user cfg_flags, got: {cfg:?}");
+        assert_eq!(cfg[0], "feature=\"smp\"");
     }
 
     #[test]
