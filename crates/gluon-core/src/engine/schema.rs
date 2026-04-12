@@ -5,7 +5,8 @@
 //! tooling can consume without parsing. The schema is built by calling
 //! `gen_fn_metadata_to_json(false)` on a freshly-registered engine and
 //! classifying each function entry as either a top-level constructor or
-//! a builder method based on the presence of `thisType`.
+//! a builder method based on the first parameter type (`&mut Builder`
+//! indicates a method).
 
 use std::collections::BTreeMap;
 
