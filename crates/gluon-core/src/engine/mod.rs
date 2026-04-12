@@ -20,6 +20,7 @@ use std::rc::Rc;
 mod builders;
 mod conversions;
 pub(crate) mod intern;
+pub mod schema;
 pub(crate) mod validate;
 
 /// Engine state shared by all builders during a single script evaluation.
@@ -117,6 +118,20 @@ pub fn dsl_signatures() -> Vec<String> {
     let mut sigs = engine.gen_fn_signatures(false);
     sigs.sort();
     sigs
+}
+
+/// Build a structured [`schema::DslSchema`] from a fresh Gluon engine.
+///
+/// Like [`dsl_signatures`], this is pure introspection — a throwaway
+/// engine is built and no script is evaluated. The schema carries typed
+/// information about constructors, builder methods, and global constants
+/// that tooling (LSP, tree-sitter query packs) can consume without
+/// parsing signature strings.
+pub fn dsl_schema() -> schema::DslSchema {
+    let state = EngineState::new(PathBuf::from("<dsl-introspection>"));
+    let mut engine = Engine::new();
+    builders::register_all(&mut engine, &state);
+    schema::DslSchema::from_engine(&engine)
 }
 
 /// Parse and evaluate a `gluon.rhai` file, returning the resulting
