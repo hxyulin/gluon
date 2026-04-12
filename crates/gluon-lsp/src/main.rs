@@ -27,6 +27,7 @@
 mod completion;
 mod hover;
 mod index;
+mod parser;
 mod word;
 
 use anyhow::{Context, Result};
