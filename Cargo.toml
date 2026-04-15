@@ -5,6 +5,7 @@ members = [
     "crates/gluon-core",
     "crates/gluon-cli",
     "crates/gluon-lsp",
+    "crates/tree-sitter-rhai",
 ]
 default-members = ["crates/gluon-cli"]
 

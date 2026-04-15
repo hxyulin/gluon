@@ -32,6 +32,10 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tree-sitter = "0.26"
+# Vendored locally because no published crate exists for the Rhai
+# grammar. See `crates/tree-sitter-rhai/` for the C grammar source and
+# build script. Path dependency keeps the LSP buildable offline.
+tree-sitter-rhai = { path = "../tree-sitter-rhai" }
 
 [dev-dependencies]
 tempfile = "3"
