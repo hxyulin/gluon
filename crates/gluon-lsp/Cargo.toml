@@ -12,6 +12,10 @@ categories.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "gluon_lsp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gluon-lsp"
 path = "src/main.rs"
