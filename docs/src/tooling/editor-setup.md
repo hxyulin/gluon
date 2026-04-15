@@ -37,6 +37,48 @@ require('lspconfig').rust_analyzer.setup {
 If you use a different LSP client, the key setting is the same: point
 `linkedProjects` at your `rust-project.json` path.
 
+### Gluon DSL highlighting (gluon-lsp)
+
+For rich editing of `gluon.rhai` — completions, hover signatures,
+diagnostics, and DSL-specific syntax highlighting — install and register
+`gluon-lsp`:
+
+1. Install the binary:
+
+   ```sh
+   cargo install --path crates/gluon-lsp
+   ```
+
+2. Install `tree-sitter-rhai` for base Rhai syntax (strings, comments,
+   numbers, keywords):
+
+   ```
+   :TSInstall rhai
+   ```
+
+3. Register `gluon-lsp` with nvim-lspconfig (Neovim 0.9+):
+
+   ```lua
+   local lspconfig = require('lspconfig')
+   local configs = require('lspconfig.configs')
+
+   if not configs.gluon then
+     configs.gluon = {
+       default_config = {
+         cmd = { 'gluon-lsp' },
+         filetypes = { 'rhai' },
+         root_dir = lspconfig.util.root_pattern('gluon.rhai'),
+       },
+     }
+   end
+
+   lspconfig.gluon.setup({})
+   ```
+
+   DSL-specific highlighting (Gluon builtins and builder methods) is
+   delivered automatically via LSP semantic tokens — no query files to
+   copy or maintain. Neovim 0.9+ applies semantic tokens out of the box.
+
 ## Helix
 
 Add the following to `.helix/languages.toml` in your project root:
