@@ -24,6 +24,7 @@
 //! `rhai::Engine::compile` and walking the AST; keeping the current
 //! file free of that complexity is deliberate.
 
+mod analysis;
 mod completion;
 mod hover;
 mod index;
