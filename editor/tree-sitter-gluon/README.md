@@ -1,78 +1,56 @@
 # tree-sitter-gluon
 
-Editor query overrides that teach your Rhai tree-sitter grammar about
-Gluon's DSL surface — `project`, `target`, `group`, `config_option`,
-`qemu`, and all the builder methods — so they get highlighted as
-builtins instead of plain identifiers.
+> **This directory no longer ships query files.**
+>
+> DSL-specific highlighting (Gluon builtins such as `project`, `target`,
+> `group`, `config_option`, `qemu`, and all builder methods) is now
+> delivered by **gluon-lsp** via LSP semantic tokens. There is no
+> `highlights.scm` to copy.
 
-> **This is not a fork of `tree-sitter-rhai`.** There is no grammar
-> here. We use the upstream Rhai grammar unchanged and layer these
-> queries on top. The Rhai DSL's syntax is plain Rhai.
+## How highlighting works now
 
-## What this pack gives you
+| Layer | What it covers | Provided by |
+|-------|---------------|-------------|
+| Base Rhai syntax (strings, comments, numbers, keywords, operators) | Tree-sitter grammar | `tree-sitter-rhai` |
+| Gluon DSL builtins and builder methods | Semantic token classification | `gluon-lsp` |
 
-- **`queries/highlights.scm`** — recolors every function that Gluon
-  registers at runtime as `@function.builtin`. Generated from a live
-  Gluon engine via `gluon internal dump-dsl`, so it can never drift
-  out of sync with the `register_fn` calls in
-  `crates/gluon-core/src/engine/builders/`.
+The LSP emits semantic tokens for every call-site it recognises — the
+editor applies the theme colours automatically, with no query files to
+maintain or regenerate.
 
-## What this pack does **not** give you
+## Editor setup (Neovim)
 
-- **Semantic autocomplete.** Tree-sitter is a parser — it has no
-  concept of types, function signatures, or scope. If you want to see
-  what methods exist on a `CrateBuilder` after `.add(...)`, you need
-  an LSP. That is what `crates/gluon-lsp/` exists to provide. Install
-  both for the full experience.
-- **Locals / indent / folds for base Rhai.** Install upstream
-  [`tree-sitter-rhai`](https://github.com/lf-lang/tree-sitter-rhai)
-  first; these queries layer on top of what it already provides.
+1. Install `tree-sitter-rhai` for base Rhai syntax:
 
-## Install
-
-### Neovim (with nvim-treesitter)
-
-1. Install `tree-sitter-rhai` per `:TSInstall rhai` (requires a parser
-   registered for the `rhai` filetype).
-2. Drop the file into your runtime queries path as an override:
-
-   ```sh
-   mkdir -p ~/.config/nvim/after/queries/rhai
-   cp editor/tree-sitter-gluon/queries/highlights.scm \
-      ~/.config/nvim/after/queries/rhai/highlights.scm
+   ```
+   :TSInstall rhai
    ```
 
-   Files under `after/queries/<lang>/` are loaded *after* the base
-   grammar's queries, so Gluon's builtins take precedence over any
-   generic `@function` capture.
-
-### Helix
-
-1. Ensure Rhai is in your `languages.toml` or that Helix ships a Rhai
-   grammar in your runtime.
-2. Copy the highlights into Helix's runtime queries directory:
+2. Install `gluon-lsp`:
 
    ```sh
-   mkdir -p ~/.config/helix/runtime/queries/rhai
-   cp editor/tree-sitter-gluon/queries/highlights.scm \
-      ~/.config/helix/runtime/queries/rhai/highlights.scm
+   cargo install --path crates/gluon-lsp
    ```
 
-### Zed
+3. Register `gluon-lsp` with nvim-lspconfig (Neovim 0.9+):
 
-At the time of writing, Zed's Rhai support is community-driven. Point
-a local extension at this queries directory, or copy the file into the
-extension's `languages/rhai/` folder.
+   ```lua
+   local lspconfig = require('lspconfig')
+   local configs = require('lspconfig.configs')
 
-## Regenerating `highlights.scm`
+   if not configs.gluon then
+     configs.gluon = {
+       default_config = {
+         cmd = { 'gluon-lsp' },
+         filetypes = { 'rhai' },
+         root_dir = lspconfig.util.root_pattern('gluon.rhai'),
+       },
+     }
+   end
 
-Whenever gluon's DSL surface changes (a new `register_fn` in
-`crates/gluon-core/src/engine/builders/`), refresh the query list:
+   lspconfig.gluon.setup({})
+   ```
 
-```sh
-./scripts/regen-dsl-queries.sh
-```
-
-The script invokes `cargo run --bin gluon -- internal dump-dsl` and
-rewrites `queries/highlights.scm`. Review the diff, commit both the
-engine change and the regenerated queries in the same commit.
+   Neovim 0.9+ applies semantic tokens automatically; no additional
+   plugin is required. DSL builtins will be highlighted as soon as the
+   LSP attaches to a `gluon.rhai` buffer.

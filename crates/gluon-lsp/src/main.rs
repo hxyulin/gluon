@@ -4,8 +4,7 @@
 //! thread reading messages off the receiver and dispatching by method
 //! name — no async runtime, no worker pool. State is held in memory:
 //! a [`DslSchema`] (built once at startup, drives semantic analysis),
-//! a [`DslIndex`] (drives completion + hover until Tasks 8/9 rewrite
-//! them against the schema), a [`RhaiParser`] (cheap to construct,
+//! a [`RhaiParser`] (cheap to construct,
 //! cached so the tree-sitter parser allocation amortizes), a buffer
 //! map, and a per-document analysis cache so semantic-token requests
 //! can serve the most recent analysis without reparsing.
@@ -24,7 +23,6 @@
 use anyhow::{Context, Result};
 use gluon_core::engine::schema::DslSchema;
 use gluon_lsp::analysis::{self, AnalysisResult};
-use gluon_lsp::index::DslIndex;
 use gluon_lsp::parser::Parser as _;
 use gluon_lsp::parser::rhai::RhaiParser;
 use gluon_lsp::{completion, diagnostics, hover, semantic_tokens};
@@ -83,17 +81,14 @@ fn main() -> Result<()> {
     let _init: InitializeParams =
         serde_json::from_value(init_params).context("parse InitializeParams")?;
 
-    // Build the schema + symbol index exactly once. Subsequent requests
-    // all read from this shared state. The index is a flat by-name
-    // collapse of the schema kept around until completion/hover are
-    // rewritten against the schema in Tasks 8/9.
+    // Build the schema once at startup. All subsequent requests read
+    // from this shared state.
     let schema = gluon_core::engine::dsl_schema();
-    let index = DslIndex::from_engine();
     let parser = RhaiParser::new();
     let docs: HashMap<Url, String> = HashMap::new();
     let analysis_cache: HashMap<Url, AnalysisResult> = HashMap::new();
 
-    main_loop(connection, schema, index, parser, docs, analysis_cache)?;
+    main_loop(connection, schema, parser, docs, analysis_cache)?;
 
     io_threads.join().context("LSP io thread join failed")?;
     Ok(())
@@ -109,7 +104,6 @@ fn main() -> Result<()> {
 fn main_loop(
     connection: Connection,
     schema: DslSchema,
-    _index: DslIndex,
     parser: RhaiParser,
     mut docs: HashMap<Url, String>,
     mut analysis_cache: HashMap<Url, AnalysisResult>,

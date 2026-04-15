@@ -8,7 +8,6 @@ pub mod analysis;
 pub mod completion;
 pub mod diagnostics;
 pub mod hover;
-pub mod index;
 pub mod parser;
 pub mod semantic_tokens;
 pub mod word;
