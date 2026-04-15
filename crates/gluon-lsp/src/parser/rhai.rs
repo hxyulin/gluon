@@ -56,6 +56,15 @@ impl Parser for RhaiParser {
         let mut statements = Vec::new();
         let mut errors = Vec::new();
 
+        // Tree-sitter marks two flavors of parse failure: ERROR nodes
+        // (unexpected tokens) and "missing" nodes (expected tokens the
+        // parser had to invent for recovery, e.g. an unclosed `(`).
+        // The lowering pass only sees ERROR; walk the tree once up
+        // front to surface the missing-token ranges too, so mid-edit
+        // states like `project(` produce a diagnostic instead of a
+        // silently-clean FnCall.
+        collect_missing(&root, &mut errors);
+
         // Root is `Rhai`. Its named children are `Stmt` nodes.
         let mut cursor = root.walk();
         for stmt in root.named_children(&mut cursor) {
@@ -63,6 +72,16 @@ impl Parser for RhaiParser {
         }
 
         SyntaxTree { statements, errors }
+    }
+}
+
+fn collect_missing(node: &tree_sitter::Node, errors: &mut Vec<TextRange>) {
+    if node.is_missing() {
+        errors.push(ts_range(node));
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_missing(&child, errors);
     }
 }
 
@@ -249,9 +268,20 @@ fn lower_expr(
             range: ts_range(&node),
         }),
 
-        // Anything else: try to descend through the first named child
-        // so we don't silently drop something we just haven't enumerated.
-        _ => first_named(&node).and_then(|c| lower_expr(c, source, errors)),
+        // Anything else (e.g. ExprFn, ExprIf, ExprBlock, ExprLet,
+        // ExprWhile, ...) is a construct the semantic layer doesn't
+        // model. Surface it as an Error so the LSP reports an
+        // "unsupported construct" diagnostic at the right range,
+        // rather than silently descending into the first named child
+        // and misinterpreting e.g. `fn foo() { 1 }` as the identifier
+        // `foo`. Wrappers that are pure single-child descents
+        // (`Expr`, `ExprParen`, `ExprLit`, `Lit`, `ExprPath`/`Path`,
+        // `ExprDotAccess`) are enumerated above.
+        _ => {
+            let range = ts_range(&node);
+            errors.push(range);
+            Some(Node::Error { range })
+        }
     }
 }
 
@@ -566,6 +596,38 @@ mod tests {
         assert!(
             has_call || has_error,
             "expected call or error; got: {:?}",
+            tree
+        );
+    }
+
+    #[test]
+    fn fn_declaration_not_silently_swallowed() {
+        // Regression: the lower_expr fallback used to descend through
+        // the first named child of any unknown node kind, which made
+        // `fn foo() { 1 }` lower to Identifier { name: "foo" } with
+        // the body silently dropped.
+        let tree = parse("fn foo() { 1 }");
+        for stmt in &tree.statements {
+            if let Node::Identifier { name, .. } = stmt {
+                assert_ne!(
+                    name, "foo",
+                    "fn declaration silently lowered to Identifier"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_paren_surfaces_error() {
+        // Regression: tree-sitter inserts a "missing" `)` token to
+        // recover from `project(`, which leaves has_error()==true on
+        // the tree but no ERROR node — so the lowering pass alone
+        // wouldn't surface it. The dedicated missing-token walk in
+        // parse() must catch it.
+        let tree = parse("project(");
+        assert!(
+            !tree.errors.is_empty(),
+            "missing closing paren should be in errors; tree: {:?}",
             tree
         );
     }
