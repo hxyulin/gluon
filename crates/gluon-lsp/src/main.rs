@@ -26,9 +26,11 @@
 
 mod analysis;
 mod completion;
+mod diagnostics;
 mod hover;
 mod index;
 mod parser;
+mod semantic_tokens;
 mod word;
 
 use anyhow::{Context, Result};
