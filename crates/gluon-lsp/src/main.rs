@@ -129,7 +129,15 @@ fn main_loop(
                     // be ignored, or EOF will end the iterator.
                     break;
                 }
-                handle_request(&connection, &index, &docs, &analysis_cache, req)?;
+                handle_request(
+                    &connection,
+                    &schema,
+                    &parser,
+                    &index,
+                    &docs,
+                    &analysis_cache,
+                    req,
+                )?;
             }
             Message::Notification(not) => {
                 handle_notification(
@@ -152,6 +160,8 @@ fn main_loop(
 
 fn handle_request(
     connection: &Connection,
+    schema: &DslSchema,
+    parser: &RhaiParser,
     index: &DslIndex,
     docs: &HashMap<Url, String>,
     analysis_cache: &HashMap<Url, AnalysisResult>,
@@ -163,7 +173,7 @@ fn handle_request(
             let uri = params.text_document_position.text_document.uri;
             let pos = params.text_document_position.position;
             let doc = docs.get(&uri).map(String::as_str).unwrap_or("");
-            let resp = completion::complete(index, doc, pos);
+            let resp = completion::complete(schema, parser, doc, pos);
             send_result(connection, id, resp)?;
         }
         "textDocument/hover" => {
