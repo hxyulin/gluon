@@ -1,0 +1,24 @@
+[package]
+name = "tree-sitter-rhai"
+version = "0.0.1"
+edition.workspace = true
+license = "MIT"
+description = "Vendored tree-sitter grammar for the Rhai scripting language. Sourced from elkowar/tree-sitter-rhai; not published."
+publish = false
+build = "build.rs"
+
+# Lints intentionally not inherited from the workspace: this crate is
+# a thin wrapper around generated C code and a small unsafe FFI binding.
+# The workspace `unsafe_code = "warn"` would create noise we can't fix.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tree-sitter = "0.26"

@@ -2,40 +2,37 @@
 //!
 //! Uses `lsp-server` for stdio transport. The event loop is a single
 //! thread reading messages off the receiver and dispatching by method
-//! name — no async runtime, no worker pool. Everything we serve is
-//! answered from an in-memory [`DslIndex`] (built once at startup)
-//! and a [`HashMap`] of open document contents, so request handling
-//! is synchronous and sub-millisecond.
+//! name — no async runtime, no worker pool. State is held in memory:
+//! a [`DslSchema`] (built once at startup, drives semantic analysis),
+//! a [`RhaiParser`] (cheap to construct,
+//! cached so the tree-sitter parser allocation amortizes), a buffer
+//! map, and a per-document analysis cache so semantic-token requests
+//! can serve the most recent analysis without reparsing.
 //!
-//! ### Phase 1 (this binary)
+//! ### Capabilities advertised
 //!
-//! - `initialize` — advertise completion + hover + full-text sync.
-//! - `textDocument/didOpen` / `didChange` / `didClose` — track buffer
-//!   contents in memory. We request `TextDocumentSyncKind::FULL`, so
-//!   every didChange notification carries the full buffer as a single
-//!   content change.
+//! - `initialize` — full-text sync, completion, hover, semantic tokens.
+//! - `textDocument/didOpen` / `didChange` — track buffer contents and
+//!   re-run analysis, publishing diagnostics back to the client.
+//! - `textDocument/didClose` — drop buffer + analysis state.
 //! - `textDocument/completion` — return every registered DSL function.
 //! - `textDocument/hover` — signature for the identifier under cursor.
-//!
-//! ### Phase 2 (explicitly not here)
-//!
-//! AST-aware completion/hover scoping, Rhai parse diagnostics, and
-//! go-to-definition. Those require parsing the buffer with
-//! `rhai::Engine::compile` and walking the AST; keeping the current
-//! file free of that complexity is deliberate.
-
-mod completion;
-mod hover;
-mod index;
-mod word;
+//! - `textDocument/semanticTokens/full` — delta-encoded classified
+//!   tokens from the cached analysis.
 
 use anyhow::{Context, Result};
-use index::DslIndex;
+use gluon_core::engine::schema::DslSchema;
+use gluon_lsp::analysis::{self, AnalysisResult};
+use gluon_lsp::parser::Parser as _;
+use gluon_lsp::parser::rhai::RhaiParser;
+use gluon_lsp::{completion, diagnostics, hover, semantic_tokens};
 use lsp_server::{Connection, ExtractError, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CompletionOptions, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, HoverProviderCapability, InitializeParams, OneOf,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    PublishDiagnosticsParams, SemanticTokens, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 use std::collections::HashMap;
 
@@ -53,11 +50,10 @@ fn main() -> Result<()> {
             TextDocumentSyncKind::FULL,
         )),
         completion_provider: Some(CompletionOptions {
-            // No trigger characters: the client asks for completions
-            // on Ctrl-Space (or the user's configured key), not on
-            // every keystroke. That keeps us out of the hot path until
-            // Phase 2 adds real scoping.
-            trigger_characters: None,
+            // `.` triggers completion mid-chain so the client asks us
+            // as soon as the user types it. Other completion contexts
+            // still work via Ctrl-Space.
+            trigger_characters: Some(vec![".".to_string()]),
             all_commit_characters: None,
             resolve_provider: Some(false),
             work_done_progress_options: Default::default(),
@@ -65,6 +61,17 @@ fn main() -> Result<()> {
         }),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(false)),
+        // Full semantic tokens only — no range or delta variants.
+        // Documents are small enough that recomputing the whole token
+        // set per request is cheaper than maintaining delta state.
+        semantic_tokens_provider: Some(
+            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                legend: semantic_tokens::legend(),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                range: None,
+                work_done_progress_options: Default::default(),
+            }),
+        ),
         ..Default::default()
     };
 
@@ -74,12 +81,14 @@ fn main() -> Result<()> {
     let _init: InitializeParams =
         serde_json::from_value(init_params).context("parse InitializeParams")?;
 
-    // Build the symbol index exactly once. Subsequent requests all
-    // read from this shared state.
-    let index = DslIndex::from_engine();
+    // Build the schema once at startup. All subsequent requests read
+    // from this shared state.
+    let schema = gluon_core::engine::dsl_schema();
+    let parser = RhaiParser::new();
     let docs: HashMap<Url, String> = HashMap::new();
+    let analysis_cache: HashMap<Url, AnalysisResult> = HashMap::new();
 
-    main_loop(connection, index, docs)?;
+    main_loop(connection, schema, parser, docs, analysis_cache)?;
 
     io_threads.join().context("LSP io thread join failed")?;
     Ok(())
@@ -94,8 +103,10 @@ fn main() -> Result<()> {
 /// channels we're still holding open.
 fn main_loop(
     connection: Connection,
-    index: DslIndex,
+    schema: DslSchema,
+    parser: RhaiParser,
     mut docs: HashMap<Url, String>,
+    mut analysis_cache: HashMap<Url, AnalysisResult>,
 ) -> Result<()> {
     for msg in &connection.receiver {
         match msg {
@@ -112,10 +123,24 @@ fn main_loop(
                     // be ignored, or EOF will end the iterator.
                     break;
                 }
-                handle_request(&connection, &index, &docs, req)?;
+                handle_request(
+                    &connection,
+                    &schema,
+                    &parser,
+                    &docs,
+                    &analysis_cache,
+                    req,
+                )?;
             }
             Message::Notification(not) => {
-                handle_notification(&mut docs, not)?;
+                handle_notification(
+                    &connection,
+                    &schema,
+                    &parser,
+                    &mut docs,
+                    &mut analysis_cache,
+                    not,
+                )?;
             }
             // Responses to server-initiated requests — we don't
             // initiate any, so there's nothing to correlate. Silently
@@ -128,8 +153,10 @@ fn main_loop(
 
 fn handle_request(
     connection: &Connection,
-    index: &DslIndex,
+    schema: &DslSchema,
+    parser: &RhaiParser,
     docs: &HashMap<Url, String>,
+    analysis_cache: &HashMap<Url, AnalysisResult>,
     req: Request,
 ) -> Result<()> {
     match req.method.as_str() {
@@ -138,7 +165,7 @@ fn handle_request(
             let uri = params.text_document_position.text_document.uri;
             let pos = params.text_document_position.position;
             let doc = docs.get(&uri).map(String::as_str).unwrap_or("");
-            let resp = completion::complete(index, doc, pos);
+            let resp = completion::complete(schema, parser, doc, pos);
             send_result(connection, id, resp)?;
         }
         "textDocument/hover" => {
@@ -146,7 +173,25 @@ fn handle_request(
             let uri = params.text_document_position_params.text_document.uri;
             let pos = params.text_document_position_params.position;
             let doc = docs.get(&uri).map(String::as_str).unwrap_or("");
-            let resp = hover::hover(index, doc, pos);
+            let resp = hover::hover(schema, parser, doc, pos);
+            send_result(connection, id, resp)?;
+        }
+        "textDocument/semanticTokens/full" => {
+            let (id, params) =
+                cast_request::<lsp_types::request::SemanticTokensFullRequest>(req)?;
+            let uri = params.text_document.uri;
+            // Serve from cache. didOpen/didChange always populate the
+            // cache before the client can issue a token request, so an
+            // empty result here means the buffer was never opened —
+            // returning empty tokens is the right LSP-spec behaviour.
+            let data = analysis_cache
+                .get(&uri)
+                .map(|r| semantic_tokens::encode(&r.tokens))
+                .unwrap_or_default();
+            let resp = SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data,
+            });
             send_result(connection, id, resp)?;
         }
         _ => {
@@ -160,35 +205,104 @@ fn handle_request(
     Ok(())
 }
 
-fn handle_notification(docs: &mut HashMap<Url, String>, not: Notification) -> Result<()> {
+fn handle_notification(
+    connection: &Connection,
+    schema: &DslSchema,
+    parser: &RhaiParser,
+    docs: &mut HashMap<Url, String>,
+    analysis_cache: &mut HashMap<Url, AnalysisResult>,
+    not: Notification,
+) -> Result<()> {
     match not.method.as_str() {
         "textDocument/didOpen" => {
-            let params: DidOpenTextDocumentParams = serde_json::from_value(not.params)
-                .context("parse DidOpenTextDocumentParams")?;
-            docs.insert(params.text_document.uri, params.text_document.text);
+            let params: DidOpenTextDocumentParams =
+                serde_json::from_value(not.params).context("parse DidOpenTextDocumentParams")?;
+            let uri = params.text_document.uri;
+            let text = params.text_document.text;
+            docs.insert(uri.clone(), text);
+            // Re-borrow through the map so we analyse the canonical
+            // stored copy — keeps the source-of-truth single.
+            let source = docs.get(&uri).map(String::as_str).unwrap_or("");
+            run_analysis_and_push_diagnostics(
+                connection,
+                schema,
+                parser,
+                &uri,
+                source,
+                analysis_cache,
+            )?;
         }
         "textDocument/didChange" => {
             let params: DidChangeTextDocumentParams = serde_json::from_value(not.params)
                 .context("parse DidChangeTextDocumentParams")?;
+            let uri = params.text_document.uri;
             // Full sync: there is exactly one content change and it
             // carries the complete new buffer. If a client sends
             // incremental changes anyway (spec violation given our
             // advertised capability), we take the last entry's text
             // as best-effort — it's the most recent edit.
             if let Some(change) = params.content_changes.into_iter().last() {
-                docs.insert(params.text_document.uri, change.text);
+                docs.insert(uri.clone(), change.text);
+                let source = docs.get(&uri).map(String::as_str).unwrap_or("");
+                run_analysis_and_push_diagnostics(
+                    connection,
+                    schema,
+                    parser,
+                    &uri,
+                    source,
+                    analysis_cache,
+                )?;
             }
         }
         "textDocument/didClose" => {
-            let params: DidCloseTextDocumentParams = serde_json::from_value(not.params)
-                .context("parse DidCloseTextDocumentParams")?;
+            let params: DidCloseTextDocumentParams =
+                serde_json::from_value(not.params).context("parse DidCloseTextDocumentParams")?;
             docs.remove(&params.text_document.uri);
+            analysis_cache.remove(&params.text_document.uri);
         }
         // Any other notification (initialized, cancelRequest, …) is
         // either handshake noise or state we don't track. Dropping
         // them silently is the right default.
         _ => {}
     }
+    Ok(())
+}
+
+/// Parse, analyse, cache the result, and push diagnostics back to the
+/// client. Called on every didOpen/didChange so the editor's red
+/// squigglies stay in sync with the buffer.
+///
+/// Diagnostics are always pushed — even an empty list — so that fixing
+/// the last error in a buffer clears the previous squigglies. If we
+/// only sent a notification when there were diagnostics, stale errors
+/// would linger in the editor.
+fn run_analysis_and_push_diagnostics(
+    connection: &Connection,
+    schema: &DslSchema,
+    parser: &RhaiParser,
+    uri: &Url,
+    source: &str,
+    analysis_cache: &mut HashMap<Url, AnalysisResult>,
+) -> Result<()> {
+    let tree = parser.parse(source);
+    let result = analysis::analyze(&tree, schema);
+
+    let lsp_diags = diagnostics::to_lsp_diagnostics(&result.diagnostics);
+    let params = PublishDiagnosticsParams {
+        uri: uri.clone(),
+        diagnostics: lsp_diags,
+        version: None,
+    };
+    let not = Notification {
+        method: "textDocument/publishDiagnostics".to_string(),
+        params: serde_json::to_value(params).context("serialize diagnostics")?,
+    };
+    connection
+        .sender
+        .send(Message::Notification(not))
+        .context("send diagnostics")?;
+
+    analysis_cache.insert(uri.clone(), result);
     Ok(())
 }
 
