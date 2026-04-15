@@ -109,7 +109,7 @@ fn main() -> Result<()> {
 fn main_loop(
     connection: Connection,
     schema: DslSchema,
-    index: DslIndex,
+    _index: DslIndex,
     parser: RhaiParser,
     mut docs: HashMap<Url, String>,
     mut analysis_cache: HashMap<Url, AnalysisResult>,
@@ -133,7 +133,6 @@ fn main_loop(
                     &connection,
                     &schema,
                     &parser,
-                    &index,
                     &docs,
                     &analysis_cache,
                     req,
@@ -162,7 +161,6 @@ fn handle_request(
     connection: &Connection,
     schema: &DslSchema,
     parser: &RhaiParser,
-    index: &DslIndex,
     docs: &HashMap<Url, String>,
     analysis_cache: &HashMap<Url, AnalysisResult>,
     req: Request,
@@ -181,7 +179,7 @@ fn handle_request(
             let uri = params.text_document_position_params.text_document.uri;
             let pos = params.text_document_position_params.position;
             let doc = docs.get(&uri).map(String::as_str).unwrap_or("");
-            let resp = hover::hover(index, doc, pos);
+            let resp = hover::hover(schema, parser, doc, pos);
             send_result(connection, id, resp)?;
         }
         "textDocument/semanticTokens/full" => {
