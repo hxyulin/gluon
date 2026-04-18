@@ -573,6 +573,35 @@ fn register_qemu(engine: &mut Engine, state: EngineState) {
             builder.clone()
         },
     );
+
+    engine.register_fn(
+        "test_timeout",
+        |builder: &mut QemuBuilder, timeout: i64| -> QemuBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            if let Some(v) = clamp_u32(timeout, "test_timeout", builder) {
+                with_qemu(builder, |q| q.test_timeout = Some(v));
+            }
+            builder.clone()
+        },
+    );
+
+    engine.register_fn(
+        "test_extra_args",
+        |builder: &mut QemuBuilder, args: rhai::Array| -> QemuBuilder {
+            if builder.is_duplicate {
+                return builder.clone();
+            }
+            with_qemu(builder, |q| {
+                q.test_extra_args = args
+                    .into_iter()
+                    .filter_map(|v| v.into_string().ok())
+                    .collect();
+            });
+            builder.clone()
+        },
+    );
 }
 
 // --- qemu() helpers ---

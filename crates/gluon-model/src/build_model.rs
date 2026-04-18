@@ -479,6 +479,14 @@ pub struct QemuDef {
     /// Defaults to `0x10` at resolve time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_success_code: Option<u8>,
+    /// Seconds before a test run is killed. Applied at resolve time when
+    /// the runner spawns QEMU for `gluon test`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_timeout: Option<u32>,
+    /// Extra QEMU arguments appended only during `gluon test`, after
+    /// both `extra_args` and any profile-level overrides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_extra_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceSpan>,
 }

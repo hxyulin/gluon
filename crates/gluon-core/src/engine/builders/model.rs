@@ -343,6 +343,69 @@ fn register_profile(engine: &mut Engine, state: EngineState) {
             }
         }
     );
+
+    // Per-profile QEMU overrides. These take precedence over the
+    // global `qemu()` settings at resolve time.
+
+    builder_method!(
+        engine,
+        "qemu_memory",
+        ProfileBuilder,
+        |state, model, name, pos, mem: i64| {
+            let _ = (state, pos);
+            if let Some(h) = model.profiles.lookup(name) {
+                if let Some(p) = model.profiles.get_mut(h) {
+                    p.qemu_memory = Some(mem as u32);
+                }
+            }
+        }
+    );
+
+    builder_method!(
+        engine,
+        "qemu_cores",
+        ProfileBuilder,
+        |state, model, name, pos, cores: i64| {
+            let _ = (state, pos);
+            if let Some(h) = model.profiles.lookup(name) {
+                if let Some(p) = model.profiles.get_mut(h) {
+                    p.qemu_cores = Some(cores as u32);
+                }
+            }
+        }
+    );
+
+    builder_method!(
+        engine,
+        "qemu_extra_args",
+        ProfileBuilder,
+        |state, model, name, pos, args: rhai::Array| {
+            let _ = (state, pos);
+            if let Some(h) = model.profiles.lookup(name) {
+                if let Some(p) = model.profiles.get_mut(h) {
+                    p.qemu_extra_args = Some(
+                        args.into_iter()
+                            .filter_map(|v| v.into_string().ok())
+                            .collect(),
+                    );
+                }
+            }
+        }
+    );
+
+    builder_method!(
+        engine,
+        "test_timeout",
+        ProfileBuilder,
+        |state, model, name, pos, timeout: i64| {
+            let _ = (state, pos);
+            if let Some(h) = model.profiles.lookup(name) {
+                if let Some(p) = model.profiles.get_mut(h) {
+                    p.test_timeout = Some(timeout as u32);
+                }
+            }
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
