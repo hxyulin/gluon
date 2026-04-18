@@ -3,3 +3,4 @@
 *.lock.bak
 .DS_Store
 docs/book/
+docs/superpowers/

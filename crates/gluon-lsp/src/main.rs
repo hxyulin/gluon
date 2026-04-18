@@ -21,6 +21,7 @@
 //!   tokens from the cached analysis.
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use gluon_core::engine::schema::DslSchema;
 use gluon_lsp::analysis::{self, AnalysisResult};
 use gluon_lsp::parser::Parser as _;
@@ -36,7 +37,24 @@ use lsp_types::{
 };
 use std::collections::HashMap;
 
+/// Editors launch the binary with no arguments and communicate over
+/// stdio. The argument surface exists only so `--help` and `--version`
+/// work for humans checking their install, without us inventing a
+/// config story we don't yet need.
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Language server for Gluon's Rhai DSL (gluon.rhai)",
+    long_about = None,
+)]
+struct Cli {}
+
 fn main() -> Result<()> {
+    // Must run before we touch stdio — clap handles --help / --version
+    // by printing and exiting, which would otherwise collide with the
+    // LSP transport grabbing stdin below.
+    Cli::parse();
+
     // stdio is the only transport we support. Editors launch us as a
     // child process and pipe LSP traffic over stdin/stdout.
     let (connection, io_threads) = Connection::stdio();

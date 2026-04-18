@@ -389,6 +389,7 @@ name = "gluon-lsp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "gluon-core",
  "lsp-server",
  "lsp-types",
