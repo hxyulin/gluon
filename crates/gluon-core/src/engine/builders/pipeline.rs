@@ -50,8 +50,11 @@ pub struct QemuBuilder {
     is_duplicate: bool,
 }
 
-/// Chainable builder returned by `bootloader(kind)`. Stub: values go into
-/// [`gluon_model::BootloaderDef::extras`].
+/// Chainable builder returned by `bootloader(kind)`. Known options
+/// (`entry_crate`, `protocol`, `config_file`) write to typed fields on
+/// [`gluon_model::BootloaderDef`]; the generic `set(key, value)` escape
+/// hatch routes unrecognised keys into
+/// [`gluon_model::BootloaderDef::extras`] for forward compatibility.
 #[derive(Clone)]
 pub struct BootloaderBuilder {
     state: EngineState,
@@ -735,7 +738,8 @@ fn register_bootloader(engine: &mut Engine, state: EngineState) {
             if builder.is_duplicate {
                 return builder.clone();
             }
-            set_extra(builder, "config_file", file.into());
+            let mut model = builder.state.model.borrow_mut();
+            model.bootloader.config_file = Some(file.into());
             builder.clone()
         },
     );

@@ -374,7 +374,12 @@ pub struct BootloaderDef {
     /// Resolved handle for `entry_crate`, populated by the intern pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_crate_handle: Option<Handle<CrateDef>>,
-    /// Forward-compatible escape hatch for protocol-specific metadata.
+    /// Path to a bootloader configuration file (e.g. `boot.cfg` for
+    /// Limine). Resolved relative to the project root by consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_file: Option<String>,
+    /// Forward-compatible escape hatch for protocol-specific metadata
+    /// that does not yet have a typed field above.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extras: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -719,11 +724,8 @@ mod tests {
             protocol: Some("gop".into()),
             entry_crate: Some("bootloader".into()),
             entry_crate_handle: None,
-            extras: {
-                let mut m = BTreeMap::new();
-                m.insert("config_file".into(), "boot.cfg".into());
-                m
-            },
+            config_file: Some("boot.cfg".into()),
+            extras: BTreeMap::new(),
             span: None,
         };
         let json = serde_json::to_string(&bl).unwrap();
@@ -731,10 +733,8 @@ mod tests {
         assert_eq!(de.kind, "uefi");
         assert_eq!(de.protocol.as_deref(), Some("gop"));
         assert_eq!(de.entry_crate.as_deref(), Some("bootloader"));
-        assert_eq!(
-            de.extras.get("config_file").map(String::as_str),
-            Some("boot.cfg")
-        );
+        assert_eq!(de.config_file.as_deref(), Some("boot.cfg"));
+        assert!(de.extras.is_empty());
     }
 
     #[test]

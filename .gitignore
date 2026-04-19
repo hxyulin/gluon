@@ -4,3 +4,5 @@
 .DS_Store
 docs/book/
 docs/superpowers/
+tests/fixtures/*/build/
+tests/fixtures/*/esp/
