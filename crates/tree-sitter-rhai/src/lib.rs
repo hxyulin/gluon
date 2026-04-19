@@ -13,8 +13,10 @@ unsafe extern "C" {
 
 /// Tree-sitter language for the Rhai scripting language.
 ///
-/// Convert into [`tree_sitter::Language`] with `LANGUAGE.into()` or
-/// `Language::from(LANGUAGE)`.
+/// Convert into a `tree_sitter::Language` with `LANGUAGE.into()` or
+/// `Language::from(LANGUAGE)`. (We don't depend on `tree-sitter`
+/// directly — only `tree-sitter-language` — so the `Language` type is
+/// referenced as plain code rather than an intra-doc link.)
 pub const LANGUAGE: LanguageFn = unsafe { LanguageFn::from_raw(tree_sitter_rhai) };
 
 /// Source of the highlight queries (empty placeholder — grammar's
