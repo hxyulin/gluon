@@ -189,6 +189,7 @@ pub fn ensure_config_crate(
     target_handle: Handle<TargetDef>,
     sysroot_dir: &Path,
     _stdout: &mut Vec<u8>,
+    stderr_sink: &mut Vec<u8>,
 ) -> Result<(String, PathBuf, bool)> {
     let layout = &ctx.layout;
 
@@ -329,6 +330,7 @@ pub fn ensure_config_crate(
                 ),
             ])
         }),
+        stderr_sink,
     )?;
 
     Ok((crate_name, output_path, was_cached))

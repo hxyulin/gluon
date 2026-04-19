@@ -100,7 +100,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
             // ------------------------------------------------------------------
             DagNode::Sysroot(target) => {
                 let (path, was_cached) = helpers::sysroot::ensure_sysroot_for_node(
-                    self.ctx, self.model, target, stdout,
+                    self.ctx, self.model, target, stdout, stderr,
                 )?;
                 lock_or_poison(self.sysroots, "sysroots")?.insert(target, path);
                 self.record(was_cached);
@@ -131,6 +131,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                     target,
                     &sysroot_dir,
                     stdout,
+                    stderr,
                 )?;
                 lock_or_poison(self.artifacts, "artifacts")?.set_config_crate(target, rlib_path);
                 self.record(was_cached);
@@ -189,12 +190,14 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                         artifacts: &artifacts_snapshot,
                         sysroot_dir: sysroot_dir.as_deref(),
                     },
+                    stderr,
                 )?;
 
                 lock_or_poison(self.artifacts, "artifacts")?.insert(crate_handle, out_path);
                 self.record(was_cached);
+                // Crate compiles never write to stdout — rustc emits everything
+                // to stderr, which the worker pool flushes per-job.
                 let _ = stdout;
-                let _ = stderr; // output buffering: future work
                 Ok(())
             }
 

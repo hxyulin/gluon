@@ -12,18 +12,21 @@ use std::path::PathBuf;
 /// dispatcher so that every per-node operation has a consistent "helper"
 /// home — makes the `execute_pipeline` dispatch loop a flat match.
 ///
-/// The `_stdout` parameter exists so that future sysroot progress output
-/// can be buffered per-job; for now it is unused.
+/// `stderr_sink` receives rustc's stderr (warnings) from each of the three
+/// sysroot crate compiles; the worker pool flushes it to the user's
+/// stderr atomically per job. The `_stdout` parameter remains unused —
+/// the sysroot pipeline produces nothing of interest on stdout.
 pub fn ensure_sysroot_for_node(
     ctx: &CompileCtx,
     model: &BuildModel,
     target: Handle<TargetDef>,
     _stdout: &mut Vec<u8>,
+    stderr_sink: &mut Vec<u8>,
 ) -> Result<(PathBuf, bool)> {
     let target_def = model.targets.get(target).ok_or_else(|| {
         Error::Compile(format!(
             "scheduler: Sysroot node references target handle {target:?} not found in build model"
         ))
     })?;
-    sysroot::ensure_sysroot(ctx, target_def)
+    sysroot::ensure_sysroot(ctx, target_def, stderr_sink)
 }

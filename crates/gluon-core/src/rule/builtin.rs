@@ -29,13 +29,11 @@ use std::process::Command;
 /// This makes rules portable: a rule that references `./sentinel` always means
 /// `<build_dir>/sentinel` regardless of how the user invoked `gluon`.
 ///
-/// ### Stdout
+/// ### Stdout / stderr
 ///
-/// Stdout from successful rule executions is discarded in MVP-M (no output
-/// buffering integration yet). Chunk B3's scheduler worker will later provide
-/// output buffers; for now rules are silent on success. Users who need to
-/// capture output can redirect within the command itself (e.g. `sh -c 'cmd >
-/// outfile'`).
+/// Both streams are forwarded into the per-job buffers the scheduler hands
+/// us; the worker pool flushes them to the user's stdout/stderr atomically
+/// per job, so output from parallel rule runs never interleaves.
 pub struct ExecRule;
 
 impl RuleFn for ExecRule {

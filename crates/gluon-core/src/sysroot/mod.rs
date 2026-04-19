@@ -53,7 +53,11 @@ use std::path::{Path, PathBuf};
 /// The `was_cached` flag is consumed by the scheduler and surfaced via
 /// [`crate::BuildSummary`] so the CLI can report a single accurate
 /// `built N, cached M` line per build.
-pub fn ensure_sysroot(ctx: &CompileCtx, target: &TargetDef) -> Result<(PathBuf, bool)> {
+pub fn ensure_sysroot(
+    ctx: &CompileCtx,
+    target: &TargetDef,
+    stderr_sink: &mut Vec<u8>,
+) -> Result<(PathBuf, bool)> {
     let sysroot_dir = ctx.layout.sysroot_dir(target);
     let sysroot_lib_dir = ctx.layout.sysroot_lib_dir(target);
     let stamp_path = ctx.layout.sysroot_stamp(target);
@@ -112,7 +116,15 @@ pub fn ensure_sysroot(ctx: &CompileCtx, target: &TargetDef) -> Result<(PathBuf, 
 
     // Compile the three sysroot crates in dependency order. Each later
     // crate links against the rlibs produced by the earlier ones.
-    let core_rlib = build_sysroot_crate(ctx, target, rust_src, &sysroot_lib_dir, "core", &[])?;
+    let core_rlib = build_sysroot_crate(
+        ctx,
+        target,
+        rust_src,
+        &sysroot_lib_dir,
+        "core",
+        &[],
+        stderr_sink,
+    )?;
     let cbuiltins_rlib = build_sysroot_crate(
         ctx,
         target,
@@ -120,6 +132,7 @@ pub fn ensure_sysroot(ctx: &CompileCtx, target: &TargetDef) -> Result<(PathBuf, 
         &sysroot_lib_dir,
         "compiler_builtins",
         &[("core", &core_rlib)],
+        stderr_sink,
     )?;
     let _alloc_rlib = build_sysroot_crate(
         ctx,
@@ -128,6 +141,7 @@ pub fn ensure_sysroot(ctx: &CompileCtx, target: &TargetDef) -> Result<(PathBuf, 
         &sysroot_lib_dir,
         "alloc",
         &[("core", &core_rlib), ("compiler_builtins", &cbuiltins_rlib)],
+        stderr_sink,
     )?;
 
     // Persist cache updates once, after all three crates succeeded.
@@ -164,6 +178,7 @@ fn build_sysroot_crate(
     sysroot_lib_dir: &Path,
     crate_name: &str,
     extern_deps: &[(&str, &PathBuf)],
+    stderr_sink: &mut Vec<u8>,
 ) -> Result<PathBuf> {
     // Path inside `library/` that holds the crate's `src/lib.rs`. The
     // convention is `library/<crate_name>/src/lib.rs`, but
@@ -322,6 +337,7 @@ fn build_sysroot_crate(
                 ),
             ])
         }),
+        stderr_sink,
     )?;
     Ok(path)
 }
@@ -379,7 +395,8 @@ mod tests {
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
 
         let target = make_target();
-        let err = ensure_sysroot(&ctx, &target).expect_err("should fail");
+        let mut stderr_sink: Vec<u8> = Vec::new();
+        let err = ensure_sysroot(&ctx, &target, &mut stderr_sink).expect_err("should fail");
         match err {
             Error::Diagnostics(diags) => {
                 assert_eq!(diags.len(), 1);
@@ -425,7 +442,9 @@ mod tests {
 
         let cache = Cache::load(layout.cache_manifest()).0;
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
-        let (got, was_cached) = ensure_sysroot(&ctx, &target).expect("fast path");
+        let mut stderr_sink: Vec<u8> = Vec::new();
+        let (got, was_cached) =
+            ensure_sysroot(&ctx, &target, &mut stderr_sink).expect("fast path");
         assert_eq!(got, sysroot_dir);
         assert!(was_cached, "stamp fast-path must report was_cached=true");
     }
@@ -456,7 +475,9 @@ mod tests {
         let expected_hex = hex_encode(&info.version_hash());
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
 
-        let (sysroot_dir, first_cached) = ensure_sysroot(&ctx, &target).expect("first build");
+        let mut stderr_sink: Vec<u8> = Vec::new();
+        let (sysroot_dir, first_cached) =
+            ensure_sysroot(&ctx, &target, &mut stderr_sink).expect("first build");
         assert!(!first_cached, "first build must not report was_cached=true");
         let lib_dir = ctx.layout.sysroot_lib_dir(&target);
         for crate_name in ["core", "compiler_builtins", "alloc"] {
@@ -472,7 +493,8 @@ mod tests {
         // instant. 100ms is a generous upper bound for a single
         // `fs::read` + string compare.
         let start = Instant::now();
-        let (sysroot_dir2, second_cached) = ensure_sysroot(&ctx, &target).expect("second build");
+        let (sysroot_dir2, second_cached) =
+            ensure_sysroot(&ctx, &target, &mut stderr_sink).expect("second build");
         let elapsed = start.elapsed();
         assert_eq!(sysroot_dir, sysroot_dir2);
         assert!(second_cached, "second build must hit the stamp fast path");
@@ -509,7 +531,8 @@ mod tests {
         let rustc_path = info.rustc_path.clone();
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
 
-        let sysroot_dir = match ensure_sysroot(&ctx, &target) {
+        let mut stderr_sink: Vec<u8> = Vec::new();
+        let sysroot_dir = match ensure_sysroot(&ctx, &target, &mut stderr_sink) {
             Ok((d, _was_cached)) => d,
             Err(e) => {
                 eprintln!("downstream-link e2e skipped: sysroot build failed: {e:?}");

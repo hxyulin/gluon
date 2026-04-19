@@ -106,7 +106,11 @@ pub(crate) fn collect_artifact_env_sources(
 ///
 /// **Never hold the cache lock across a rustc spawn** — doing so would
 /// serialise parallel compilation on the cache mutex.
-pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<(PathBuf, bool)> {
+pub fn compile(
+    ctx: &CompileCtx,
+    input: CompileCrateInput<'_>,
+    stderr_sink: &mut Vec<u8>,
+) -> Result<(PathBuf, bool)> {
     let model = input.model;
     let resolved = input.resolved;
     let crate_ref = input.crate_ref;
@@ -258,6 +262,7 @@ pub fn compile(ctx: &CompileCtx, input: CompileCrateInput<'_>) -> Result<(PathBu
                 ),
             ])
         }),
+        stderr_sink,
     )
 }
 
@@ -1145,6 +1150,7 @@ mod tests {
         // compile() must hit the cache and return Ok(output_path) without
         // ever attempting to spawn /dev/null/bogus-rustc (which would fail
         // with an I/O error on any OS).
+        let mut stderr_sink: Vec<u8> = Vec::new();
         let result = compile(
             &ctx,
             CompileCrateInput {
@@ -1154,6 +1160,7 @@ mod tests {
                 artifacts: &artifacts,
                 sysroot_dir: None,
             },
+            &mut stderr_sink,
         );
         let (got_path, was_cached) = result.unwrap();
         assert_eq!(got_path, output_path, "cache hit must return output_path");
@@ -1493,6 +1500,7 @@ mod tests {
         let crate_ref = host_ref(ch, th);
         let artifacts = ArtifactMap::new();
 
+        let mut stderr_sink: Vec<u8> = Vec::new();
         let result = compile(
             &ctx,
             CompileCrateInput {
@@ -1502,6 +1510,7 @@ mod tests {
                 artifacts: &artifacts,
                 sysroot_dir: None,
             },
+            &mut stderr_sink,
         );
 
         let (output_path, was_cached) = result.expect("compile should succeed");

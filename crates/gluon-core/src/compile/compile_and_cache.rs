@@ -98,6 +98,7 @@ pub(crate) fn compile_and_cache(
     extra_sources: Vec<PathBuf>,
     rustc_fail: Box<RustcFailDiag>,
     depfile_fail: Box<DepfileFailDiag>,
+    stderr_sink: &mut Vec<u8>,
 ) -> Result<(PathBuf, bool)> {
     // Seed the source list from the previous run's depfile if it exists.
     // On a cold build this is empty — the cache entry is also missing,
@@ -168,6 +169,12 @@ pub(crate) fn compile_and_cache(
         let rendered = render_cmd();
         return Err(rustc_fail(&output, &rendered));
     }
+    // Surface rustc's stderr (warnings, lint messages) to the per-job
+    // buffer. The worker pool drains this to the user's stderr sink as
+    // soon as the job completes, atomically per job — so warnings on
+    // parallel compiles never interleave. The failure path above embeds
+    // stderr into the diagnostic instead, so we only forward on success.
+    stderr_sink.extend_from_slice(&output.stderr);
 
     // Parse the depfile BEFORE calling `mark_built` so the cache is only
     // updated once we have the source list in hand. If parsing fails,
