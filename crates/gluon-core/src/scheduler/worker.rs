@@ -95,7 +95,8 @@ pub struct BuildSummary {
     /// therefore skipped rustc entirely.
     pub cached: usize,
     /// Assembled-ESP directories keyed by [`gluon_model::EspDef`] handle.
-    pub esp_dirs: std::collections::BTreeMap<gluon_model::Handle<gluon_model::EspDef>, std::path::PathBuf>,
+    pub esp_dirs:
+        std::collections::BTreeMap<gluon_model::Handle<gluon_model::EspDef>, std::path::PathBuf>,
 }
 
 /// Per-node execution closure.

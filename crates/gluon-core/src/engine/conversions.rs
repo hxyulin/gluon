@@ -9,7 +9,13 @@ use rhai::{Dynamic, Map, Position};
 use std::collections::BTreeMap;
 
 /// Allowed keys inside an entry of a `.deps(#{ ... })` map.
-const ALLOWED_DEP_KEYS: &[&str] = &["crate", "default_features", "features", "optional", "version"];
+const ALLOWED_DEP_KEYS: &[&str] = &[
+    "crate",
+    "default_features",
+    "features",
+    "optional",
+    "version",
+];
 
 /// Parse a `.deps(#{ ... })` map strictly.
 ///

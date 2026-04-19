@@ -320,8 +320,8 @@ pub(crate) fn build_rustc_command(
         // of where the build was invoked from. Fall back to the original
         // path if canonicalisation fails — e.g. inside tests that don't
         // actually write the artifact to disk.
-        let abs_path = std::fs::canonicalize(artifact_path)
-            .unwrap_or_else(|_| artifact_path.to_path_buf());
+        let abs_path =
+            std::fs::canonicalize(artifact_path).unwrap_or_else(|_| artifact_path.to_path_buf());
         builder.env(env_key.as_str(), abs_path.as_os_str());
     }
 

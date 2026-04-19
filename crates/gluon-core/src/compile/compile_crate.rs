@@ -29,9 +29,9 @@
 //! Keeping this order stable is non-negotiable: any reordering of the
 //! flags invalidates every on-disk cache entry.
 
+use super::command_builder::build_rustc_command;
 #[cfg(test)]
 use crate::cache::BuildRecord;
-use super::command_builder::build_rustc_command;
 use crate::compile::{ArtifactMap, CompileCtx};
 use crate::error::{Diagnostic, Error, Result};
 use gluon_model::{BuildModel, CrateDef, CrateType, ResolvedConfig, ResolvedCrateRef};
@@ -268,11 +268,11 @@ mod tests {
     use crate::compile::command_builder::build_rustc_command;
     use crate::compile::compile_utils::normalize_crate_name;
     use crate::compile::{ArtifactMap, BuildLayout, RustcCommandBuilder, RustcInfo};
-    use std::borrow::Cow;
     use gluon_model::{
         BuildModel, CrateDef, CrateType, DepDef, Handle, ProjectDef, ResolvedConfig,
         ResolvedCrateRef, ResolvedProfile, TargetDef,
     };
+    use std::borrow::Cow;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -793,7 +793,8 @@ mod tests {
             .expect("KERNEL_PATH must be injected");
         // canonicalize on /build/... will fall back to the literal.
         assert_eq!(
-            kernel_env, kernel_out.as_os_str(),
+            kernel_env,
+            kernel_out.as_os_str(),
             "KERNEL_PATH must carry the kernel artifact path"
         );
     }

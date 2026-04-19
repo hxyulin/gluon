@@ -606,10 +606,7 @@ fn gluon_build_uefi_bootloader_kernel_assembles_esp() {
         "bootloader should have been copied to {boot_x64:?}"
     );
     let boot_bytes = fs::read(&boot_x64).expect("read BOOTX64.EFI");
-    assert!(
-        !boot_bytes.is_empty(),
-        "BOOTX64.EFI must not be empty"
-    );
+    assert!(!boot_bytes.is_empty(), "BOOTX64.EFI must not be empty");
     // PE32+ header magic: MZ at offset 0.
     assert_eq!(
         &boot_bytes[..2],
@@ -655,8 +652,7 @@ fn gluon_run_uefi_bootloader_kernel_real_qemu_debugcon() {
         );
         return;
     }
-    let Some(()) =
-        require_rustc_or_skip("gluon_run_uefi_bootloader_kernel_real_qemu_debugcon")
+    let Some(()) = require_rustc_or_skip("gluon_run_uefi_bootloader_kernel_real_qemu_debugcon")
     else {
         return;
     };

@@ -170,9 +170,7 @@ fn resolve_type(
                         diagnostics.push(Diagnostic {
                             range: *method_range,
                             severity: Severity::Error,
-                            message: format!(
-                                "`{method}` is not a method on `{builder_name}`"
-                            ),
+                            message: format!("`{method}` is not a method on `{builder_name}`"),
                         });
                         for arg in args {
                             resolve_type(arg, schema, tokens, diagnostics);
@@ -295,9 +293,8 @@ mod tests {
 
     #[test]
     fn valid_chain_produces_no_diagnostics() {
-        let result = analyze_src(
-            r#"group("kernel").target("x86_64-unknown-none").edition("2021");"#,
-        );
+        let result =
+            analyze_src(r#"group("kernel").target("x86_64-unknown-none").edition("2021");"#);
         let errors: Vec<_> = result
             .diagnostics
             .iter()

@@ -861,8 +861,7 @@ fn start_esp(s: &EngineState, pos: Position, name: &str) -> EspBuilder {
     drop(model);
     if is_duplicate {
         s.push_diagnostic(
-            Diagnostic::error(format!("esp(\"{name}\") is defined more than once"))
-                .with_span(span),
+            Diagnostic::error(format!("esp(\"{name}\") is defined more than once")).with_span(span),
         );
     }
     EspBuilder {

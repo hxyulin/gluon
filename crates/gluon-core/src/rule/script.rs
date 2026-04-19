@@ -53,7 +53,10 @@ pub fn execute_script(
     // Build scope with context variables.
     let mut scope = rhai::Scope::new();
     scope.push("build_dir", ctx.layout.root().display().to_string());
-    scope.push("project_root", ctx.resolved.project_root.display().to_string());
+    scope.push(
+        "project_root",
+        ctx.resolved.project_root.display().to_string(),
+    );
     scope.push("profile", ctx.resolved.profile.name.clone());
     scope.push("target", target_name);
     scope.push("project_name", ctx.resolved.project.name.clone());
@@ -76,29 +79,32 @@ pub fn execute_script(
     let artifacts = ctx.artifacts.clone();
     let model_crates = ctx.model.crates.clone();
     let rule_name_for_artifact = rule.name.clone();
-    engine.register_fn("artifact", move |name: &str| -> std::result::Result<String, Box<rhai::EvalAltResult>> {
-        let handle = model_crates.lookup(name).ok_or_else(|| {
-            Box::new(rhai::EvalAltResult::ErrorRuntime(
-                format!(
-                    "rule '{}': artifact('{}') — unknown crate",
-                    rule_name_for_artifact, name
-                )
-                .into(),
-                rhai::Position::NONE,
-            ))
-        })?;
-        let path = artifacts.get(handle).ok_or_else(|| {
-            Box::new(rhai::EvalAltResult::ErrorRuntime(
-                format!(
-                    "rule '{}': artifact('{}') — crate has no compiled artifact",
-                    rule_name_for_artifact, name
-                )
-                .into(),
-                rhai::Position::NONE,
-            ))
-        })?;
-        Ok(path.display().to_string())
-    });
+    engine.register_fn(
+        "artifact",
+        move |name: &str| -> std::result::Result<String, Box<rhai::EvalAltResult>> {
+            let handle = model_crates.lookup(name).ok_or_else(|| {
+                Box::new(rhai::EvalAltResult::ErrorRuntime(
+                    format!(
+                        "rule '{}': artifact('{}') — unknown crate",
+                        rule_name_for_artifact, name
+                    )
+                    .into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+            let path = artifacts.get(handle).ok_or_else(|| {
+                Box::new(rhai::EvalAltResult::ErrorRuntime(
+                    format!(
+                        "rule '{}': artifact('{}') — crate has no compiled artifact",
+                        rule_name_for_artifact, name
+                    )
+                    .into(),
+                    rhai::Position::NONE,
+                ))
+            })?;
+            Ok(path.display().to_string())
+        },
+    );
 
     // Register `exec(cmd, args)` function.
     let build_root = ctx.layout.root().to_path_buf();

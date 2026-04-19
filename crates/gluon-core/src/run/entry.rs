@@ -136,10 +136,10 @@ pub fn run(
         ))
     })?;
     let suffix = crate::compile::compile_utils::exe_suffix_for_target(&target.spec);
-    let kernel: PathBuf = ctx
-        .layout
-        .cross_final_dir(target, profile)
-        .join(format!("{}{suffix}", crate::compile::compile_utils::normalize_crate_name(&krate.name)));
+    let kernel: PathBuf = ctx.layout.cross_final_dir(target, profile).join(format!(
+        "{}{suffix}",
+        crate::compile::compile_utils::normalize_crate_name(&krate.name)
+    ));
 
     // Step 3: resolve QEMU config.
     //
@@ -182,9 +182,7 @@ pub fn run(
                     .map(|(h, _)| h)
                     .expect("model.esps.len() == 1");
                 let esp_def = model.esps.get(esp_handle).ok_or_else(|| {
-                    Error::Compile(
-                        "internal: esp handle iterates but does not resolve".to_string(),
-                    )
+                    Error::Compile("internal: esp handle iterates but does not resolve".to_string())
                 })?;
                 let esp_path = build_summary
                     .as_ref()

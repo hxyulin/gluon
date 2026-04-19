@@ -23,8 +23,8 @@
 //! A more incremental approach would mean threading position info
 //! through the parser; not worth it until we see a real perf problem.
 
-use crate::parser::{Node, Parser as _, SyntaxTree};
 use crate::parser::rhai::RhaiParser;
+use crate::parser::{Node, Parser as _, SyntaxTree};
 use gluon_core::engine::schema::{DslSchema, FnSig, ReturnType};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, Documentation, InsertTextFormat,
@@ -94,7 +94,11 @@ fn cursor_context(doc: &str, pos: Position) -> CompletionContext {
 fn top_level_items(schema: &DslSchema) -> Vec<CompletionItem> {
     let mut out = Vec::with_capacity(schema.constructors.len() + schema.global_constants.len());
     for ctor in schema.constructors.values() {
-        out.push(function_item(&ctor.name, &ctor.overloads, CompletionItemKind::FUNCTION));
+        out.push(function_item(
+            &ctor.name,
+            &ctor.overloads,
+            CompletionItemKind::FUNCTION,
+        ));
     }
     for (name, value) in &schema.global_constants {
         out.push(constant_item(name, *value));
@@ -178,9 +182,10 @@ fn resolve_chain_builder(
 /// produced multiple statements (rare; the user's prefix included a
 /// `;` mid-line), the last one is the chain we care about.
 fn pick_chain_root(tree: &SyntaxTree) -> Option<&Node> {
-    tree.statements.iter().rev().find(|n| {
-        matches!(n, Node::FnCall { .. } | Node::MethodCall { .. })
-    })
+    tree.statements
+        .iter()
+        .rev()
+        .find(|n| matches!(n, Node::FnCall { .. } | Node::MethodCall { .. }))
 }
 
 /// Walk a chain expression, threading the receiver builder type
@@ -235,10 +240,7 @@ mod tests {
         };
         assert!(labels.contains(&"target".to_string()));
         assert!(labels.contains(&"add".to_string()));
-        assert!(
-            !labels.contains(&"memory".to_string()),
-            "got: {labels:?}"
-        );
+        assert!(!labels.contains(&"memory".to_string()), "got: {labels:?}");
     }
 
     #[test]

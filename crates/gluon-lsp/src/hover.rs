@@ -14,17 +14,12 @@
 //! Returns `None` for unknowns — the LSP spec treats `None` as "no
 //! hover content", which is what editors display as "nothing here".
 
-use crate::parser::{Node, Parser as _, TextRange};
 use crate::parser::rhai::RhaiParser;
+use crate::parser::{Node, Parser as _, TextRange};
 use gluon_core::engine::schema::{DslSchema, FnSig, ReturnType};
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
-pub fn hover(
-    schema: &DslSchema,
-    parser: &RhaiParser,
-    doc: &str,
-    pos: Position,
-) -> Option<Hover> {
+pub fn hover(schema: &DslSchema, parser: &RhaiParser, doc: &str, pos: Position) -> Option<Hover> {
     let tree = parser.parse(doc);
 
     // Walk every statement; the first hit wins. Statements are
@@ -134,7 +129,11 @@ fn chain_type(node: &Node, schema: &DslSchema) -> Option<String> {
             receiver, method, ..
         } => {
             let recv_builder = chain_type(receiver, schema)?;
-            let m = schema.builder_types.get(&recv_builder)?.methods.get(method)?;
+            let m = schema
+                .builder_types
+                .get(&recv_builder)?
+                .methods
+                .get(method)?;
             match &m.returns {
                 ReturnType::SelfType => Some(recv_builder),
                 ReturnType::Builder(b) => Some(b.clone()),

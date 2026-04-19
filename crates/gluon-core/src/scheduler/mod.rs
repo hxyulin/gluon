@@ -82,7 +82,10 @@ impl<'a> PipelineDispatcher<'a> {
 /// poisoned and all subsequent `lock()` calls would panic. This helper
 /// converts that into a recoverable `Error::Config` so the build fails
 /// with a diagnostic instead of an abort.
-fn lock_or_poison<'a, T>(mutex: &'a std::sync::Mutex<T>, name: &str) -> Result<std::sync::MutexGuard<'a, T>> {
+fn lock_or_poison<'a, T>(
+    mutex: &'a std::sync::Mutex<T>,
+    name: &str,
+) -> Result<std::sync::MutexGuard<'a, T>> {
     mutex
         .lock()
         .map_err(|_| Error::Config(format!("scheduler: {name} mutex poisoned")))
@@ -99,8 +102,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                 let (path, was_cached) = helpers::sysroot::ensure_sysroot_for_node(
                     self.ctx, self.model, target, stdout,
                 )?;
-                lock_or_poison(self.sysroots, "sysroots")?
-                    .insert(target, path);
+                lock_or_poison(self.sysroots, "sysroots")?.insert(target, path);
                 self.record(was_cached);
                 Ok(())
             }
@@ -114,15 +116,13 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                 // this lookup must always succeed.
                 let sysroot_dir = {
                     let map = lock_or_poison(self.sysroots, "sysroots")?;
-                    map.get(&target)
-                        .cloned()
-                        .ok_or_else(|| {
-                            Error::Compile(
-                                "scheduler: ConfigCrate ran before its Sysroot dependency; \
+                    map.get(&target).cloned().ok_or_else(|| {
+                        Error::Compile(
+                            "scheduler: ConfigCrate ran before its Sysroot dependency; \
                                  DAG edge missing?"
-                                    .into(),
-                            )
-                        })?
+                                .into(),
+                        )
+                    })?
                 };
                 let (_name, rlib_path, was_cached) = helpers::config_crate::ensure_config_crate(
                     self.ctx,
@@ -132,8 +132,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                     &sysroot_dir,
                     stdout,
                 )?;
-                lock_or_poison(self.artifacts, "artifacts")?
-                    .set_config_crate(target, rlib_path);
+                lock_or_poison(self.artifacts, "artifacts")?.set_config_crate(target, rlib_path);
                 self.record(was_cached);
                 Ok(())
             }
@@ -179,8 +178,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                 // would serialise all parallel compilations on this single
                 // mutex. Cloning a BTreeMap of a few dozen entries is cheap
                 // compared to a rustc invocation.
-                let artifacts_snapshot = lock_or_poison(self.artifacts, "artifacts")?
-                    .clone();
+                let artifacts_snapshot = lock_or_poison(self.artifacts, "artifacts")?.clone();
 
                 let (out_path, was_cached) = compile_crate(
                     self.ctx,
@@ -193,8 +191,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                     },
                 )?;
 
-                lock_or_poison(self.artifacts, "artifacts")?
-                    .insert(crate_handle, out_path);
+                lock_or_poison(self.artifacts, "artifacts")?.insert(crate_handle, out_path);
                 self.record(was_cached);
                 let _ = stdout;
                 let _ = stderr; // output buffering: future work
@@ -210,8 +207,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                 // source-crate handles to their artifact paths without
                 // holding the lock across the filesystem copy. Pattern
                 // mirrors the `Crate` arm above.
-                let artifacts_snapshot = lock_or_poison(self.artifacts, "artifacts")?
-                    .clone();
+                let artifacts_snapshot = lock_or_poison(self.artifacts, "artifacts")?.clone();
                 let (path, was_cached) = helpers::esp::ensure_esp(
                     self.ctx,
                     self.model,
@@ -220,8 +216,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                     &artifacts_snapshot,
                     stdout,
                 )?;
-                lock_or_poison(self.esps, "esps")?
-                    .insert(esp_handle, path);
+                lock_or_poison(self.esps, "esps")?.insert(esp_handle, path);
                 self.record(was_cached);
                 let _ = stderr;
                 Ok(())
@@ -241,8 +236,7 @@ impl<'a> JobDispatcher for PipelineDispatcher<'a> {
                 // Snapshot the artifact map so rules can reference compiled
                 // outputs via ${artifact:<crate_name>}. Same lock-and-clone
                 // pattern used by Esp nodes.
-                let artifacts_snapshot =
-                    lock_or_poison(self.artifacts, "artifacts")?.clone();
+                let artifacts_snapshot = lock_or_poison(self.artifacts, "artifacts")?.clone();
                 let rule_ctx = RuleCtx {
                     layout: &self.ctx.layout,
                     resolved: self.resolved,

@@ -212,12 +212,7 @@ pub fn generate_rust_project_json(
         // parent path. We append `library` only here, on emission.
         top.insert(
             "sysroot_src".to_string(),
-            Value::String(
-                rust_src
-                    .join("library")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            Value::String(rust_src.join("library").to_string_lossy().into_owned()),
         );
     }
     top.insert("crates".to_string(), Value::Array(crates_array));

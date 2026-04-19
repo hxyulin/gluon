@@ -491,10 +491,10 @@ fn reachable_crates(model: &BuildModel, root: Handle<CrateDef>) -> BTreeSet<Hand
     // entries of that ESP. An ESP is assembled as a unit — partial inclusion
     // would produce a broken boot partition.
     for (_h, esp) in model.esps.iter() {
-        let any_reachable = esp
-            .entries
-            .iter()
-            .any(|e| e.source_crate_handle.is_some_and(|sh| visited.contains(&sh)));
+        let any_reachable = esp.entries.iter().any(|e| {
+            e.source_crate_handle
+                .is_some_and(|sh| visited.contains(&sh))
+        });
         if any_reachable {
             for entry in &esp.entries {
                 if let Some(sh) = entry.source_crate_handle {
@@ -1133,12 +1133,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: resolve a named profile and return the set of crate names.
-    fn crate_names_for_profile(
-        model: &BuildModel,
-        profile: &str,
-    ) -> Vec<String> {
-        let cfg = resolve(model, profile, None, Path::new("/tmp/proj"), None)
-            .expect("resolve");
+    fn crate_names_for_profile(model: &BuildModel, profile: &str) -> Vec<String> {
+        let cfg = resolve(model, profile, None, Path::new("/tmp/proj"), None).expect("resolve");
         cfg.crates
             .iter()
             .map(|c| model.crates.get(c.handle).unwrap().name.clone())
@@ -1184,7 +1180,10 @@ mod tests {
         );
         let model = evaluate_script(f.path()).expect("evaluate");
         let names = crate_names_for_profile(&model, "default");
-        assert!(names.contains(&"crate_a".into()), "boot_binary is reachable");
+        assert!(
+            names.contains(&"crate_a".into()),
+            "boot_binary is reachable"
+        );
         assert!(
             !names.contains(&"crate_b".into()),
             "crate_b is unreachable from crate_a, got {names:?}"

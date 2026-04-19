@@ -72,9 +72,8 @@ impl EspStamp {
             path: parent.to_path_buf(),
             source: e,
         })?;
-        let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
-            Error::Compile(format!("esp stamp serialize failed: {e}"))
-        })?;
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|e| Error::Compile(format!("esp stamp serialize failed: {e}")))?;
         // Atomic write: write to temp + rename, so an interrupted run
         // never leaves a half-written JSON file that would crash the
         // next load.

@@ -1358,7 +1358,10 @@ mod tests {
             .node_index
             .get(&DagNode::ConfigCrate(t2))
             .expect("ConfigCrate(t2) must exist");
-        assert_ne!(cfg1_id, cfg2_id, "different targets → different config nodes");
+        assert_ne!(
+            cfg1_id, cfg2_id,
+            "different targets → different config nodes"
+        );
 
         // Each cross crate depends on its own ConfigCrate.
         let c1_id = *dag.node_index.get(&DagNode::Crate(c1)).unwrap();

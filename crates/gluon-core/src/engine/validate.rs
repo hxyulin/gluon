@@ -320,10 +320,20 @@ mod tests {
 
         let mut diags = Vec::new();
         check_artifact_deps_resolve(&model, &mut diags);
-        assert_eq!(diags.len(), 1, "expected one dangling-artifact_dep diagnostic");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected one dangling-artifact_dep diagnostic"
+        );
         let msg = &diags[0].message;
-        assert!(msg.contains("consumer"), "diag must name the consumer crate: {msg}");
-        assert!(msg.contains("ghost"), "diag must name the missing target: {msg}");
+        assert!(
+            msg.contains("consumer"),
+            "diag must name the consumer crate: {msg}"
+        );
+        assert!(
+            msg.contains("ghost"),
+            "diag must name the missing target: {msg}"
+        );
     }
 
     #[test]

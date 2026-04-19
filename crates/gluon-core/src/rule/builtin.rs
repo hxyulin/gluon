@@ -140,7 +140,9 @@ mod tests {
         let registry = RuleRegistry::with_builtins();
         let rule = make_exec_rule("myrule", vec![]);
 
-        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        let err = registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap_err();
         match err {
             Error::Compile(msg) => {
                 assert!(msg.contains("exec"), "should mention exec: {msg}");
@@ -182,7 +184,9 @@ mod tests {
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
 
         assert!(
             std::path::Path::new(&sentinel_path).exists(),
@@ -213,7 +217,9 @@ mod tests {
             span: None,
         };
 
-        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        let err = registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap_err();
         match err {
             Error::Diagnostics(diags) => {
                 assert!(!diags.is_empty(), "should have at least one diagnostic");

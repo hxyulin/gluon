@@ -243,8 +243,16 @@ mod tests {
     fn direct_mode_basic_argv() {
         let resolved = stub_resolved();
         let kernel = PathBuf::from("/tmp/build/kernel");
-        let inv =
-            build_qemu_command(&resolved, &kernel, BootMode::Direct, None, &[], false, false).unwrap();
+        let inv = build_qemu_command(
+            &resolved,
+            &kernel,
+            BootMode::Direct,
+            None,
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         let args = args_to_strings(&inv.args);
         assert_eq!(
             args,
@@ -271,8 +279,16 @@ mod tests {
         let mut r = stub_resolved();
         r.memory_mb = 1024;
         r.cores = 4;
-        let inv =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Direct, None, &[], false, false).unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Direct,
+            None,
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         assert!(a.windows(2).any(|w| w == ["-m", "1024M"]));
         assert!(a.windows(2).any(|w| w == ["-smp", "4"]));
@@ -315,8 +331,8 @@ mod tests {
     fn uefi_mode_requires_ovmf() {
         let mut r = stub_resolved();
         r.boot_mode = BootMode::Uefi;
-        let err =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Uefi, None, &[], false, false).unwrap_err();
+        let err = build_qemu_command(&r, Path::new("/k"), BootMode::Uefi, None, &[], false, false)
+            .unwrap_err();
         assert!(matches!(err, Error::Config(_)));
     }
 
@@ -333,8 +349,16 @@ mod tests {
             code: PathBuf::from("/a"),
             vars: PathBuf::from("/b"),
         };
-        let inv = build_qemu_command(&r, Path::new("/k"), BootMode::Uefi, Some(&ovmf), &[], false, false)
-            .unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Uefi,
+            Some(&ovmf),
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         let expected = format!("format=raw,file=fat:rw:{}", esp.display());
         assert!(
@@ -358,8 +382,16 @@ mod tests {
             code: PathBuf::from("/a"),
             vars: PathBuf::from("/b"),
         };
-        let inv = build_qemu_command(&r, Path::new("/k"), BootMode::Uefi, Some(&ovmf), &[], false, false)
-            .unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Uefi,
+            Some(&ovmf),
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         let expected = format!("format=raw,file={}", img.display());
         assert!(
@@ -378,8 +410,16 @@ mod tests {
             code: PathBuf::from("/a"),
             vars: PathBuf::from("/b"),
         };
-        let err = build_qemu_command(&r, Path::new("/k"), BootMode::Uefi, Some(&ovmf), &[], false, false)
-            .unwrap_err();
+        let err = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Uefi,
+            Some(&ovmf),
+            &[],
+            false,
+            false,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::EspMissing { .. }));
     }
 
@@ -387,8 +427,16 @@ mod tests {
     fn user_display_override_skips_default_display_none() {
         let mut r = stub_resolved();
         r.extra_args = vec!["-display".into(), "gtk".into()];
-        let inv =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Direct, None, &[], false, false).unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Direct,
+            None,
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         // Default "none" must not be injected when user specified -display.
         let idx = a.iter().position(|s| s == "-display").unwrap();
@@ -400,8 +448,16 @@ mod tests {
     fn user_cli_display_override_also_skips_default() {
         let r = stub_resolved();
         let extra = [os("-display"), os("curses")];
-        let inv =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Direct, None, &extra, false, false).unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Direct,
+            None,
+            &extra,
+            false,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         // Default -display none should NOT appear; the user's -display
         // curses is appended at the end via cli_extras.
@@ -419,8 +475,16 @@ mod tests {
         let mut r = stub_resolved();
         r.extra_args = vec!["-d".into(), "int".into()];
         let extra = [os("-no-reboot")];
-        let inv =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Direct, None, &extra, false, false).unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Direct,
+            None,
+            &extra,
+            false,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         // The kernel flag is part of gluon's managed section;
         // user args (rhai then cli) come after it in order.
@@ -434,8 +498,16 @@ mod tests {
     fn serial_none_emits_none() {
         let mut r = stub_resolved();
         r.serial = SerialMode::None;
-        let inv =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Direct, None, &[], false, false).unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Direct,
+            None,
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         let idx = a.iter().position(|s| s == "-serial").unwrap();
         assert_eq!(a[idx + 1], "none");
@@ -445,8 +517,16 @@ mod tests {
     fn serial_file_emits_file_spec() {
         let mut r = stub_resolved();
         r.serial = SerialMode::File(PathBuf::from("/tmp/out.log"));
-        let inv =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Direct, None, &[], false, false).unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Direct,
+            None,
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         let idx = a.iter().position(|s| s == "-serial").unwrap();
         assert_eq!(a[idx + 1], "file:/tmp/out.log");
@@ -456,16 +536,32 @@ mod tests {
     fn timeout_propagates_to_invocation() {
         let mut r = stub_resolved();
         r.timeout = Some(Duration::from_secs(10));
-        let inv =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Direct, None, &[], false, false).unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Direct,
+            None,
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(inv.timeout, Some(Duration::from_secs(10)));
     }
 
     #[test]
     fn test_mode_off_omits_isa_debug_exit() {
         let r = stub_resolved();
-        let inv =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Direct, None, &[], false, false).unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Direct,
+            None,
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         assert!(
             !a.iter().any(|s| s.contains("isa-debug-exit")),
@@ -477,8 +573,16 @@ mod tests {
     fn test_mode_on_emits_isa_debug_exit_with_resolved_port() {
         let mut r = stub_resolved();
         r.test_exit_port = 0xf4;
-        let inv =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Direct, None, &[], true, false).unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Direct,
+            None,
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         // Expect the pair `-device isa-debug-exit,iobase=0xf4,iosize=0x04`.
         let pair: Vec<_> = a
@@ -500,8 +604,16 @@ mod tests {
     fn test_mode_honours_custom_exit_port() {
         let mut r = stub_resolved();
         r.test_exit_port = 0x501;
-        let inv =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Direct, None, &[], true, false).unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Direct,
+            None,
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         assert!(
             a.iter()
@@ -518,8 +630,16 @@ mod tests {
         // -device entry and trust the order.
         let mut r = stub_resolved();
         r.extra_args = vec!["-d".into(), "int".into()];
-        let inv =
-            build_qemu_command(&r, Path::new("/k"), BootMode::Direct, None, &[], true, false).unwrap();
+        let inv = build_qemu_command(
+            &r,
+            Path::new("/k"),
+            BootMode::Direct,
+            None,
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
         let a = args_to_strings(&inv.args);
         let pos_device = a
             .iter()

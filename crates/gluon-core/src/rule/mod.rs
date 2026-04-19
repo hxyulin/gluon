@@ -171,7 +171,13 @@ impl RuleRegistry {
 ///
 /// In addition to these, the prefixed form `${artifact:<crate_name>}` resolves
 /// to the output path of a compiled crate.
-const KNOWN_VARS: &[&str] = &["build_dir", "profile", "project_name", "project_root", "target"];
+const KNOWN_VARS: &[&str] = &[
+    "build_dir",
+    "profile",
+    "project_name",
+    "project_root",
+    "target",
+];
 
 /// Substitute all `${var}` tokens in a list of argument strings.
 ///
@@ -486,7 +492,9 @@ mod tests {
             span: None,
         };
 
-        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        let err = registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap_err();
         match err {
             Error::Compile(msg) => {
                 assert!(
@@ -641,7 +649,9 @@ mod tests {
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
 
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(args.len(), 4);
@@ -683,7 +693,9 @@ mod tests {
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(args, vec!["testproject-debug-x86_64-test".to_string()]);
     }
@@ -716,7 +728,9 @@ mod tests {
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(args, vec!["café-debug-naïve".to_string()]);
     }
@@ -746,7 +760,9 @@ mod tests {
             span: None,
         };
 
-        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        let err = registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap_err();
         match err {
             Error::Compile(msg) => {
                 assert!(msg.contains("badrule"), "should name rule: {msg}");
@@ -783,7 +799,9 @@ mod tests {
             span: None,
         };
 
-        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        let err = registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap_err();
         match err {
             Error::Compile(msg) => {
                 assert!(msg.contains("badrule"), "should name rule: {msg}");
@@ -822,7 +840,9 @@ mod tests {
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
 
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(
@@ -856,7 +876,9 @@ mod tests {
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
 
         let out_args = captured_outputs.lock().unwrap().clone();
         assert_eq!(out_args.len(), 1);
@@ -925,7 +947,9 @@ mod tests {
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(args[1], artifact_path.display().to_string());
     }
@@ -955,7 +979,9 @@ mod tests {
             span: None,
         };
 
-        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        let err = registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap_err();
         match err {
             Error::Compile(msg) => {
                 assert!(msg.contains("nonexistent"), "should name crate: {msg}");
@@ -990,7 +1016,9 @@ mod tests {
             span: None,
         };
 
-        let err = registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap_err();
+        let err = registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap_err();
         match err {
             Error::Compile(msg) => {
                 assert!(msg.contains("empty"), "should mention empty: {msg}");
@@ -1028,7 +1056,9 @@ mod tests {
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(
             args[0],
@@ -1061,7 +1091,9 @@ mod tests {
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(args[0], "echo ${HOME}");
     }
@@ -1091,7 +1123,9 @@ mod tests {
             span: None,
         };
 
-        registry.dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new()).unwrap();
+        registry
+            .dispatch(&ctx, &rule, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
         let args = captured_inputs.lock().unwrap().clone();
         assert_eq!(args[0], "cost: $5");
     }

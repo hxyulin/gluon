@@ -151,7 +151,11 @@ mod tests {
             map.config_crate(t0),
             Some(Path::new("/build/libmyproject_config.rlib"))
         );
-        assert_eq!(map.config_crate(t1), None, "other target has no config crate");
+        assert_eq!(
+            map.config_crate(t1),
+            None,
+            "other target has no config crate"
+        );
 
         // Overwrite is supported (e.g. a rebuild of the config crate).
         map.set_config_crate(t0, PathBuf::from("/build/libmyproject_config_v2.rlib"));

@@ -670,8 +670,7 @@ mod tests {
             crate_type: CrateType::Bin,
             ..Default::default()
         };
-        c.artifact_env
-            .insert("KERNEL_PATH".into(), "kernel".into());
+        c.artifact_env.insert("KERNEL_PATH".into(), "kernel".into());
         c.artifact_deps.push("kernel".into());
 
         let json = serde_json::to_string(&c).unwrap();
@@ -732,7 +731,10 @@ mod tests {
         assert_eq!(de.kind, "uefi");
         assert_eq!(de.protocol.as_deref(), Some("gop"));
         assert_eq!(de.entry_crate.as_deref(), Some("bootloader"));
-        assert_eq!(de.extras.get("config_file").map(String::as_str), Some("boot.cfg"));
+        assert_eq!(
+            de.extras.get("config_file").map(String::as_str),
+            Some("boot.cfg")
+        );
     }
 
     #[test]

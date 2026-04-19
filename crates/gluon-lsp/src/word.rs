@@ -63,7 +63,10 @@ mod tests {
     #[test]
     fn word_at_picks_up_identifier_end() {
         // Cursor after the last `t` in "target"
-        assert_eq!(word_at("target(\"foo\")", pos(0, 6)).as_deref(), Some("target"));
+        assert_eq!(
+            word_at("target(\"foo\")", pos(0, 6)).as_deref(),
+            Some("target")
+        );
     }
 
     #[test]
@@ -95,5 +98,4 @@ mod tests {
             Some("config_option")
         );
     }
-
 }

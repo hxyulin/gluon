@@ -166,11 +166,7 @@ fn collect_from_stmt(
 /// `Node`. Returns `None` for purely structural nodes with no useful
 /// content — but in practice we try hard to descend into something
 /// recognisable.
-fn lower_expr(
-    node: tree_sitter::Node,
-    source: &str,
-    errors: &mut Vec<TextRange>,
-) -> Option<Node> {
+fn lower_expr(node: tree_sitter::Node, source: &str, errors: &mut Vec<TextRange>) -> Option<Node> {
     if node.is_error() || node.kind() == "ERROR" {
         let range = ts_range(&node);
         errors.push(range);
@@ -290,11 +286,7 @@ fn lower_expr(
 /// Shape: `ExprCall { fn_name: Expr, ArgList { args: Expr* } }`.
 /// If `fn_name` resolves through to `ExprDotAccess(receiver_expr,
 /// member_path_expr)`, it's a method call.
-fn lower_call(
-    node: tree_sitter::Node,
-    source: &str,
-    errors: &mut Vec<TextRange>,
-) -> Option<Node> {
+fn lower_call(node: tree_sitter::Node, source: &str, errors: &mut Vec<TextRange>) -> Option<Node> {
     let fn_name = node.child_by_field_name("fn_name")?;
     let arg_list = find_child_by_kind(&node, "ArgList");
     let args = collect_args(arg_list, source, errors);
@@ -345,10 +337,7 @@ fn lower_call(
 /// Walk through `Expr > ExprPath > Path > ident` (or any prefix of
 /// that) and return the identifier text + range. Used for both
 /// function names and method names.
-fn extract_method_name(
-    mut node: tree_sitter::Node,
-    source: &str,
-) -> Option<(String, TextRange)> {
+fn extract_method_name(mut node: tree_sitter::Node, source: &str) -> Option<(String, TextRange)> {
     // Unwrap up to a few layers; bail if we don't find an `ident`.
     for _ in 0..6 {
         match node.kind() {
@@ -491,8 +480,7 @@ mod tests {
 
     #[test]
     fn parses_method_chain() {
-        let tree =
-            parse("group(\"kernel\").target(\"x86_64-unknown-none\").edition(\"2021\");");
+        let tree = parse("group(\"kernel\").target(\"x86_64-unknown-none\").edition(\"2021\");");
         assert_eq!(tree.statements.len(), 1, "tree: {:?}", tree);
 
         // Outermost: .edition("2021"). Receiver: .target(...). Receiver
@@ -609,10 +597,7 @@ mod tests {
         let tree = parse("fn foo() { 1 }");
         for stmt in &tree.statements {
             if let Node::Identifier { name, .. } = stmt {
-                assert_ne!(
-                    name, "foo",
-                    "fn declaration silently lowered to Identifier"
-                );
+                assert_ne!(name, "foo", "fn declaration silently lowered to Identifier");
             }
         }
     }

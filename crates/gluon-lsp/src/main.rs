@@ -64,9 +64,7 @@ fn main() -> Result<()> {
         // carries the whole document, so we don't need an incremental
         // delta applier. The buffers are small (gluon.rhai files are
         // typically <1KB) so the bandwidth cost is irrelevant.
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(
-            TextDocumentSyncKind::FULL,
-        )),
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         completion_provider: Some(CompletionOptions {
             // `.` triggers completion mid-chain so the client asks us
             // as soon as the user types it. Other completion contexts
@@ -82,14 +80,14 @@ fn main() -> Result<()> {
         // Full semantic tokens only — no range or delta variants.
         // Documents are small enough that recomputing the whole token
         // set per request is cheaper than maintaining delta state.
-        semantic_tokens_provider: Some(
-            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
                 legend: semantic_tokens::legend(),
                 full: Some(SemanticTokensFullOptions::Bool(true)),
                 range: None,
                 work_done_progress_options: Default::default(),
-            }),
-        ),
+            },
+        )),
         ..Default::default()
     };
 
@@ -141,14 +139,7 @@ fn main_loop(
                     // be ignored, or EOF will end the iterator.
                     break;
                 }
-                handle_request(
-                    &connection,
-                    &schema,
-                    &parser,
-                    &docs,
-                    &analysis_cache,
-                    req,
-                )?;
+                handle_request(&connection, &schema, &parser, &docs, &analysis_cache, req)?;
             }
             Message::Notification(not) => {
                 handle_notification(
@@ -195,8 +186,7 @@ fn handle_request(
             send_result(connection, id, resp)?;
         }
         "textDocument/semanticTokens/full" => {
-            let (id, params) =
-                cast_request::<lsp_types::request::SemanticTokensFullRequest>(req)?;
+            let (id, params) = cast_request::<lsp_types::request::SemanticTokensFullRequest>(req)?;
             let uri = params.text_document.uri;
             // Serve from cache. didOpen/didChange always populate the
             // cache before the client can issue a token request, so an
@@ -251,8 +241,8 @@ fn handle_notification(
             )?;
         }
         "textDocument/didChange" => {
-            let params: DidChangeTextDocumentParams = serde_json::from_value(not.params)
-                .context("parse DidChangeTextDocumentParams")?;
+            let params: DidChangeTextDocumentParams =
+                serde_json::from_value(not.params).context("parse DidChangeTextDocumentParams")?;
             let uri = params.text_document.uri;
             // Full sync: there is exactly one content change and it
             // carries the complete new buffer. If a client sends
@@ -337,7 +327,11 @@ where
             anyhow::anyhow!("failed to parse `{method}` params: {error}")
         }
         ExtractError::MethodMismatch(req) => {
-            anyhow::anyhow!("method mismatch: expected `{}`, got `{}`", R::METHOD, req.method)
+            anyhow::anyhow!(
+                "method mismatch: expected `{}`, got `{}`",
+                R::METHOD,
+                req.method
+            )
         }
     })
 }

@@ -739,8 +739,8 @@ fn multi_profile_fixture_model() {
         "multi-profile fixture missing at {script:?}"
     );
 
-    let model = gluon_core::evaluate(&script)
-        .expect("evaluate multi-profile gluon.rhai should succeed");
+    let model =
+        gluon_core::evaluate(&script).expect("evaluate multi-profile gluon.rhai should succeed");
 
     // -- Project & default_profile --
     let project = model.project.as_ref().expect("project should be set");

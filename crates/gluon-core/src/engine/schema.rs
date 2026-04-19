@@ -138,9 +138,7 @@ impl DslSchema {
 
             // Build the user-visible param list, skipping the `&mut self`
             // receiver for methods.
-            let param_iter = raw_params
-                .map(|arr| arr.as_slice())
-                .unwrap_or_default();
+            let param_iter = raw_params.map(|arr| arr.as_slice()).unwrap_or_default();
             let skip = if receiver_type.is_some() { 1 } else { 0 };
             let params: Vec<ParamInfo> = param_iter
                 .iter()

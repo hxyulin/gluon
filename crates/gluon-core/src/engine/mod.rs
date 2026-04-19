@@ -204,10 +204,7 @@ mod tests {
         // relying on dsl_signatures() will silently degrade — fail
         // loudly here instead.
         let sigs = dsl_signatures();
-        let has = |name: &str| {
-            sigs.iter()
-                .any(|s| s.starts_with(&format!("{name}(")))
-        };
+        let has = |name: &str| sigs.iter().any(|s| s.starts_with(&format!("{name}(")));
         for name in [
             "project",
             "target",
@@ -1024,8 +1021,9 @@ mod tests {
         match err {
             Error::Diagnostics(v) => {
                 assert!(
-                    v.iter().any(|d| d.message.contains("ghost")
-                        && d.message.contains("does not exist")),
+                    v.iter().any(
+                        |d| d.message.contains("ghost") && d.message.contains("does not exist")
+                    ),
                     "expected unknown-source-crate diagnostic, got: {v:?}"
                 );
             }
@@ -1048,7 +1046,8 @@ mod tests {
         match err {
             Error::Diagnostics(v) => {
                 assert!(
-                    v.iter().any(|d| d.message.contains("relative to the ESP root")),
+                    v.iter()
+                        .any(|d| d.message.contains("relative to the ESP root")),
                     "expected relative-path diagnostic, got: {v:?}"
                 );
             }

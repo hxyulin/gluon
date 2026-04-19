@@ -2,7 +2,7 @@
 //! full analysis pipeline and verify tokens + diagnostics.
 
 use gluon_lsp::analysis::{self, Severity, TokenType};
-use gluon_lsp::parser::{rhai::RhaiParser, Parser};
+use gluon_lsp::parser::{Parser, rhai::RhaiParser};
 
 #[test]
 fn analyze_minimal_uefi_fixture() {

@@ -37,42 +37,24 @@ pub enum Node {
         range: TextRange,
     },
     /// Bare identifier: `LIB`, `BIN`
-    Identifier {
-        name: String,
-        range: TextRange,
-    },
+    Identifier { name: String, range: TextRange },
     /// String literal: `"hello"`
-    StringLiteral {
-        value: String,
-        range: TextRange,
-    },
+    StringLiteral { value: String, range: TextRange },
     /// Integer literal: `256`
-    IntLiteral {
-        value: i64,
-        range: TextRange,
-    },
+    IntLiteral { value: i64, range: TextRange },
     /// Boolean literal: `true`, `false`
-    BoolLiteral {
-        value: bool,
-        range: TextRange,
-    },
+    BoolLiteral { value: bool, range: TextRange },
     /// Array literal: `["a", "b"]`
     ArrayLiteral {
         elements: Vec<Node>,
         range: TextRange,
     },
     /// Map literal: `#{ key: value }`
-    MapLiteral {
-        range: TextRange,
-    },
+    MapLiteral { range: TextRange },
     /// Comment (line or block)
-    Comment {
-        range: TextRange,
-    },
+    Comment { range: TextRange },
     /// Parse error node — tree-sitter error recovery
-    Error {
-        range: TextRange,
-    },
+    Error { range: TextRange },
 }
 
 /// The parsed syntax tree for a document.
