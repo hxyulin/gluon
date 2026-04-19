@@ -443,8 +443,7 @@ mod tests {
         let cache = Cache::load(layout.cache_manifest()).0;
         let ctx = CompileCtx::new(layout, Arc::new(info), cache);
         let mut stderr_sink: Vec<u8> = Vec::new();
-        let (got, was_cached) =
-            ensure_sysroot(&ctx, &target, &mut stderr_sink).expect("fast path");
+        let (got, was_cached) = ensure_sysroot(&ctx, &target, &mut stderr_sink).expect("fast path");
         assert_eq!(got, sysroot_dir);
         assert!(was_cached, "stamp fast-path must report was_cached=true");
     }
