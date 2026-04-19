@@ -156,29 +156,24 @@ mod tests {
 
     #[test]
     fn clippy_program_honors_env_override() {
-        // SAFETY: tests in this module run sequentially within a single
-        // process, but parallel tests in other modules could observe
-        // this env var. CLIPPY_DRIVER is not read anywhere else in
-        // gluon-core, so the only risk is a flake if some unrelated
-        // test happens to set it concurrently. We use a uniquely-named
-        // sentinel so a stray collision is harmless.
+        // `temp_env::with_var` serializes env mutation behind a global
+        // mutex and restores the prior value on guard drop, so this is
+        // safe even under cargo's parallel test runner.
         let sentinel = "/definitely/not/a/real/clippy-driver-sentinel";
-        // SAFETY: see comment above; mutating process-global env is
-        // unsafe in 2024 edition. We restore it immediately after.
-        unsafe { std::env::set_var("CLIPPY_DRIVER", sentinel) };
-        let info = RustcInfo {
-            rustc_path: PathBuf::from("/usr/bin/rustc"),
-            rustc_arg: "rustc".into(),
-            version: "rustc 1.80.0 (test)".into(),
-            host_triple: "x86_64-unknown-linux-gnu".into(),
-            commit_hash: None,
-            release: "1.80.0".into(),
-            sysroot: PathBuf::from("/usr/lib"),
-            rust_src: None,
-            mtime_ns: 0,
-        };
-        let p = DriverKind::Clippy.program(&info);
-        unsafe { std::env::remove_var("CLIPPY_DRIVER") };
-        assert_eq!(p, PathBuf::from(sentinel));
+        temp_env::with_var("CLIPPY_DRIVER", Some(sentinel), || {
+            let info = RustcInfo {
+                rustc_path: PathBuf::from("/usr/bin/rustc"),
+                rustc_arg: "rustc".into(),
+                version: "rustc 1.80.0 (test)".into(),
+                host_triple: "x86_64-unknown-linux-gnu".into(),
+                commit_hash: None,
+                release: "1.80.0".into(),
+                sysroot: PathBuf::from("/usr/lib"),
+                rust_src: None,
+                mtime_ns: 0,
+            };
+            let p = DriverKind::Clippy.program(&info);
+            assert_eq!(p, PathBuf::from(sentinel));
+        });
     }
 }

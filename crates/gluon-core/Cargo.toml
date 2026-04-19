@@ -46,3 +46,8 @@ network-tests = []
 
 [dev-dependencies]
 tempfile = "3"
+# Scoped, safe wrapper for env var mutation in tests. Uses a global
+# mutex internally so the unsafe `std::env::set_var` (Rust 1.80+) is
+# isolated to one place. Keeps our test code free of `unsafe` blocks
+# that would otherwise need per-call SAFETY justifications.
+temp-env = "0.3"

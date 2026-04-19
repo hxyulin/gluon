@@ -380,31 +380,25 @@ ENABLED = false
 
     #[test]
     fn env_overrides_picks_up_prefixed_vars_only() {
-        // We can't safely set process-wide env vars in a parallel test
-        // run without isolation. Use a unique prefix per test instead so
-        // we don't see leakage from neighbours.
+        // Use a unique prefix per test so concurrent tests don't observe
+        // leakage. `temp_env::with_vars` restores prior state on drop.
         let prefix = "GLUON_TEST_OV_";
-        // SAFETY: setting env vars from tests; we use a unique prefix.
-        unsafe {
-            std::env::set_var("GLUON_TEST_OV_FLAG", "true");
-            std::env::set_var("GLUON_TEST_OV_NUM", "42");
-            std::env::set_var("GLUON_TEST_OV_NAME", "kernel");
-            std::env::set_var("UNRELATED_FLAG", "true");
-        }
-
-        let map = load_env_overrides(prefix);
-        assert_bool(&map, "FLAG", true);
-        assert_u64(&map, "NUM", 42);
-        assert_str(&map, "NAME", "kernel");
-        assert!(!map.contains_key("UNRELATED_FLAG"));
-        assert_eq!(map.len(), 3);
-
-        unsafe {
-            std::env::remove_var("GLUON_TEST_OV_FLAG");
-            std::env::remove_var("GLUON_TEST_OV_NUM");
-            std::env::remove_var("GLUON_TEST_OV_NAME");
-            std::env::remove_var("UNRELATED_FLAG");
-        }
+        temp_env::with_vars(
+            [
+                ("GLUON_TEST_OV_FLAG", Some("true")),
+                ("GLUON_TEST_OV_NUM", Some("42")),
+                ("GLUON_TEST_OV_NAME", Some("kernel")),
+                ("UNRELATED_FLAG", Some("true")),
+            ],
+            || {
+                let map = load_env_overrides(prefix);
+                assert_bool(&map, "FLAG", true);
+                assert_u64(&map, "NUM", 42);
+                assert_str(&map, "NAME", "kernel");
+                assert!(!map.contains_key("UNRELATED_FLAG"));
+                assert_eq!(map.len(), 3);
+            },
+        );
     }
 
     #[test]

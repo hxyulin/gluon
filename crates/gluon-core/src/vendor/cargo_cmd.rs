@@ -99,16 +99,16 @@ mod tests {
 
     #[test]
     fn resolve_cargo_honors_env_var() {
-        // Concurrent env var access is only safe because the tests in
-        // this crate agree not to clobber each other's variables —
-        // same caveat as `fmt::tests::resolve_rustfmt_env_var_then_default`.
-        // We use a sentinel path that could not plausibly collide with
-        // a real binary on any developer's machine.
+        // `temp_env::with_var` serializes through a global mutex and
+        // restores prior state on drop, so this is safe under cargo's
+        // parallel test runner.
         let sentinel = "/tmp/gluon-vendor-test-sentinel-cargo";
-        unsafe { std::env::set_var("CARGO", sentinel) };
-        assert_eq!(resolve_cargo(), PathBuf::from(sentinel));
-        unsafe { std::env::remove_var("CARGO") };
-        assert_eq!(resolve_cargo(), PathBuf::from("cargo"));
+        temp_env::with_var("CARGO", Some(sentinel), || {
+            assert_eq!(resolve_cargo(), PathBuf::from(sentinel));
+        });
+        temp_env::with_var("CARGO", None::<&str>, || {
+            assert_eq!(resolve_cargo(), PathBuf::from("cargo"));
+        });
     }
 
     #[test]
@@ -126,17 +126,9 @@ mod tests {
         std::fs::write(ws.join("lib.rs"), b"").unwrap();
 
         let bogus = "/nonexistent/gluon-vendor-test-cargo-missing";
-        // Save prior value (may be unset) and restore at end.
-        let prior = std::env::var_os("CARGO");
-        unsafe { std::env::set_var("CARGO", bogus) };
-
-        let result = run_cargo_vendor(&ws, &tmp.path().join("out"), VendorFlags::default());
-
-        // Restore BEFORE asserting so a failure doesn't leak state.
-        match prior {
-            Some(v) => unsafe { std::env::set_var("CARGO", v) },
-            None => unsafe { std::env::remove_var("CARGO") },
-        }
+        let result = temp_env::with_var("CARGO", Some(bogus), || {
+            run_cargo_vendor(&ws, &tmp.path().join("out"), VendorFlags::default())
+        });
 
         let err = result.expect_err("must fail — bogus CARGO path");
         let msg = err.to_string();

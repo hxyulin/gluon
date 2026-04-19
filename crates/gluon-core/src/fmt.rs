@@ -248,16 +248,15 @@ mod tests {
 
     #[test]
     fn resolve_rustfmt_env_var_then_default() {
-        // Combined into a single test because the two cases share
-        // process-global env state — running them as separate tests
-        // would race under cargo's parallel runner.
-        // SAFETY: this is the only test in the binary that reads or
-        // writes RUSTFMT. We set, observe, then unset, and observe
-        // the unset behavior — all in one serialized test body.
+        // `temp_env` serializes env mutation through a global mutex and
+        // restores prior state on drop, so the two cases (set / unset)
+        // can run safely under cargo's parallel test runner.
         let sentinel = "/totally/not/real/rustfmt-sentinel";
-        unsafe { std::env::set_var("RUSTFMT", sentinel) };
-        assert_eq!(resolve_rustfmt(), PathBuf::from(sentinel));
-        unsafe { std::env::remove_var("RUSTFMT") };
-        assert_eq!(resolve_rustfmt(), PathBuf::from("rustfmt"));
+        temp_env::with_var("RUSTFMT", Some(sentinel), || {
+            assert_eq!(resolve_rustfmt(), PathBuf::from(sentinel));
+        });
+        temp_env::with_var("RUSTFMT", None::<&str>, || {
+            assert_eq!(resolve_rustfmt(), PathBuf::from("rustfmt"));
+        });
     }
 }
